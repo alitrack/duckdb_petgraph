@@ -1,40 +1,55 @@
 # duckdb_petgraph
 
-DuckDB extension for graph algorithms, powered by the [petgraph](https://github.com/petgraph/petgraph) Rust crate. Run shortest path, connected components, and PageRank directly in SQL — no external graph database required.
+DuckDB extension for graph algorithms, powered by the [petgraph](https://github.com/petgraph/petgraph) Rust crate. Run shortest path, connected components, PageRank, betweenness centrality, SCC, and MST directly in SQL — no external graph database required.
 
 ## Quickstart
 
 ```sql
 LOAD 'petgraph_ext.duckdb_extension';
 
--- 1. Shortest path (Dijkstra)
-SELECT * FROM petgraph_shortest_path(
-    '[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2
-);
+-- 1. Shortest path (Dijkstra + A*)
+SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2);
 -- → (path VARCHAR, weight DOUBLE): path='[0,1,2]', weight=3.5
 
--- 2. Connected components
-SELECT * FROM petgraph_connected_components(
-    '[(0,1),(1,2),(3,4)]'
-);
--- → (node INT, component_id INT)
+-- 2. Build a cached graph for repeated queries
+SELECT * FROM petgraph_build_graph('my_graph', '[(0,1,2.5),(1,2,1.0)]', 1);
+-- 3. Query cached graph by name (zero re-parsing)
+SELECT * FROM petgraph_shortest_path('@my_graph', 0, 2);
+SELECT * FROM petgraph_pagerank('@my_graph', 0.85, 20);
+```
 
--- 3. PageRank
-SELECT * FROM petgraph_pagerank(
-    '[(0,1),(1,2),(2,0),(3,1)]', 0.85, 20
+### Feeding data from DuckDB tables
+
+```sql
+CREATE TABLE edges AS SELECT * FROM (VALUES (0,1,2.5), (1,2,1.0)) t(src, dst, weight);
+
+-- Serialize → build → cache
+SELECT * FROM petgraph_build_graph(
+    'g',
+    (SELECT '[' || string_agg('(' || src || ',' || dst || ',' || weight || ')', ',') || ']' FROM edges),
+    1
 );
--- → (node INT, score DOUBLE)
 ```
 
 ## SQL API
 
+### Data management
+
 | Function | Parameters | Returns |
 |---|---|---|
-| `petgraph_shortest_path(edges, from, to)` | edges: `[(src,dst,weight),...]`, from node, to node | (path VARCHAR, weight DOUBLE) |
-| `petgraph_connected_components(edges)` | edges: `[(src,dst),...]` | (node INT, component_id INT) |
-| `petgraph_pagerank(edges, alpha, iterations)` | edges, damping factor (e.g. 0.85), iterations (e.g. 20) | (node INT, score DOUBLE) |
+| `petgraph_build_graph(name, edges, directed)` | name, `[(src,dst,weight),...]`, 1=directed | (name, nodes, edges, directed) |
+| `petgraph_list_graphs()` | — | (name, nodes, edges, directed) |
 
-Edge format: `[(src_node, dst_node, weight), ...]`. Weight is optional — defaults to 1.0. All nodes are typed as INT32.
+### Algorithms (all accept inline edges or `@name` for cached graphs)
+
+| Function | Parameters | Returns |
+|---|---|---|
+| `petgraph_shortest_path(graph, from, to)` | graph, from node, to node | (path VARCHAR, weight DOUBLE) |
+| `petgraph_connected_components(graph)` | graph | (node INT, component_id INT) |
+| `petgraph_pagerank(graph, alpha, iterations)` | graph, damping factor, iterations | (node INT, score DOUBLE) |
+| `petgraph_betweenness_centrality(graph)` | graph (undirected) | (node INT, score DOUBLE) |
+| `petgraph_scc(graph)` | graph (directed) | (node INT, scc_id INT) |
+| `petgraph_mst(graph)` | graph (undirected) | (src INT, dst INT, weight DOUBLE) |
 
 ## Build
 
@@ -48,20 +63,17 @@ python3 scripts/metadata.py target/release/libpetgraph_ext.dylib -o petgraph_ext
 # Linux
 cargo build --release
 python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.duckdb_extension
-
-# Windows
-cargo build --release
-python3 scripts/metadata.py target/release/petgraph_ext.dll -o petgraph_ext.duckdb_extension
 ```
 
 ## Roadmap
 
-- [x] `petgraph_shortest_path()` — Dijkstra with path reconstruction
-- [x] `petgraph_connected_components()` — DFS-based component labeling
+- [x] `petgraph_build_graph()` + `petgraph_list_graphs()` — graph registry (`@name` syntax)
+- [x] `petgraph_shortest_path()` — Dijkstra with A\* path reconstruction
+- [x] `petgraph_connected_components()` — DFS component labeling
 - [x] `petgraph_pagerank()` — PageRank with configurable alpha/iterations
-- [ ] `petgraph_betweenness_centrality()` — Betweenness centrality
-- [ ] `petgraph_strongly_connected_components()` — Tarjan's SCC
-- [ ] `petgraph_min_spanning_tree()` — Kruskal's MST
+- [x] `petgraph_betweenness_centrality()` — Brandes' algorithm (hand-implemented, not in petgraph 0.7)
+- [x] `petgraph_scc()` — Tarjan's strongly connected components
+- [x] `petgraph_mst()` — Kruskal's minimum spanning tree
 - [ ] Multi-batch streaming for large graphs (>2048 nodes)
 - [ ] DuckDB Community Extension submission
 
