@@ -74,7 +74,7 @@ python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.du
 - [x] `petgraph_betweenness_centrality()` — Brandes' algorithm (hand-implemented, not in petgraph 0.7)
 - [x] `petgraph_scc()` — Tarjan's strongly connected components
 - [x] `petgraph_mst()` — Kruskal's minimum spanning tree
-- [ ] Multi-batch streaming for large graphs (>2048 nodes)
+- [x] Multi-batch streaming — all multi-row functions stream across `func()` calls, no 2048-row ceiling
 - [ ] DuckDB Community Extension submission
 
 ## License
