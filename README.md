@@ -1,6 +1,6 @@
 # duckdb_petgraph
 
-DuckDB extension for graph algorithms, powered by the [petgraph](https://github.com/petgraph/petgraph) Rust crate. Run shortest path, connected components, PageRank, betweenness centrality, SCC, and MST directly in SQL — no external graph database required.
+DuckDB extension for graph algorithms, powered by the [petgraph](https://github.com/petgraph/petgraph) Rust crate. Run PageRank, betweenness centrality, closeness centrality, eigenvector centrality, SCC, Louvain community detection, topological sort, cycle detection, shortest path, connected components, and MST directly in SQL — no external graph database required.
 
 ## Quickstart
 
@@ -51,7 +51,12 @@ SELECT * FROM petgraph_build_graph(
 | `petgraph_connected_components(graph)` | graph | (node INT, component_id INT) |
 | `petgraph_pagerank(graph, alpha, iterations)` | graph, damping factor, iterations | (node INT, score DOUBLE) |
 | `petgraph_betweenness_centrality(graph)` | graph (undirected) | (node INT, score DOUBLE) |
+| `petgraph_closeness_centrality(graph)` | graph | (node INT, centrality DOUBLE) |
+| `petgraph_eigenvector_centrality(graph, iterations, tolerance)` | graph, max_iter, tolerance | (node INT, centrality DOUBLE) |
 | `petgraph_scc(graph)` | graph (directed) | (node INT, scc_id INT) |
+| `petgraph_louvain(graph)` | graph | (node INT, community_id INT) |
+| `petgraph_toposort(graph)` | graph (directed) | (order INT, node INT) |
+| `petgraph_is_cyclic(graph)` | graph (directed) | (is_cyclic INT) |
 | `petgraph_mst(graph)` | graph (undirected) | (src INT, dst INT, weight DOUBLE) |
 
 ## Build
@@ -77,6 +82,11 @@ python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.du
 - [x] `petgraph_betweenness_centrality()` — Brandes' algorithm (hand-implemented, not in petgraph 0.7)
 - [x] `petgraph_scc()` — Tarjan's strongly connected components
 - [x] `petgraph_mst()` — Kruskal's minimum spanning tree
+- [x] `petgraph_closeness_centrality()` — Closeness centrality (hand-implemented BFS)
+- [x] `petgraph_eigenvector_centrality()` — Eigenvector centrality (power iteration)
+- [x] `petgraph_louvain()` — Louvain community detection
+- [x] `petgraph_toposort()` — Topological sort (Kahns algorithm)
+- [x] `petgraph_is_cyclic()` — Directed cycle detection
 - [x] Multi-batch streaming — all multi-row functions stream across `func()` calls, no 2048-row ceiling
 - [ ] DuckDB Community Extension submission
 
