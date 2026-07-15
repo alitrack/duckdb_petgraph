@@ -49,6 +49,16 @@ static GRAPH_REGISTRY: LazyLock<RwLock<HashMap<String, CachedGraph>>> =
 // ═══════════════════════════════════════════════
 
 type EdgeList = Vec<(i32, i32, f64)>;
+type DiGraphParts = (
+    DiGraph<(), f64>,
+    HashMap<i32, NodeIndex>,
+    HashMap<NodeIndex, i32>,
+);
+type UnGraphParts = (
+    UnGraph<(), f64>,
+    HashMap<i32, NodeIndex>,
+    HashMap<NodeIndex, i32>,
+);
 
 fn parse_edges(raw: &str) -> std::result::Result<EdgeList, Box<dyn Error>> {
     let s = raw.trim();
@@ -151,16 +161,7 @@ fn build_undigraph(
 
 /// Resolve a string param to a directed graph — either by parsing edges,
 /// or by looking up `@name` in the registry.
-fn resolve_digraph(
-    param: &str,
-) -> std::result::Result<
-    (
-        DiGraph<(), f64>,
-        HashMap<i32, NodeIndex>,
-        HashMap<NodeIndex, i32>,
-    ),
-    Box<dyn Error>,
-> {
+fn resolve_digraph(param: &str) -> std::result::Result<DiGraphParts, Box<dyn Error>> {
     if let Some(name) = param.strip_prefix('@') {
         let reg = GRAPH_REGISTRY.read().map_err(|e| e.to_string())?;
         match reg.get(name) {
@@ -183,16 +184,7 @@ fn resolve_digraph(
     }
 }
 
-fn resolve_undigraph(
-    param: &str,
-) -> std::result::Result<
-    (
-        UnGraph<(), f64>,
-        HashMap<i32, NodeIndex>,
-        HashMap<NodeIndex, i32>,
-    ),
-    Box<dyn Error>,
-> {
+fn resolve_undigraph(param: &str) -> std::result::Result<UnGraphParts, Box<dyn Error>> {
     if let Some(name) = param.strip_prefix('@') {
         let reg = GRAPH_REGISTRY.read().map_err(|e| e.to_string())?;
         match reg.get(name) {
@@ -354,6 +346,8 @@ struct LgInitData {
 #[repr(C)]
 struct LgBindData {
     entries: Vec<(String, usize, usize, bool)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct ListGraphsVTab;
@@ -384,7 +378,17 @@ impl VTab for ListGraphsVTab {
         bind.add_result_column("nodes", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("edges", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("directed", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        Ok(LgBindData { entries })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("nodes", DataType::Int32, false),
+            Field::new("edges", DataType::Int32, false),
+            Field::new("directed", DataType::Int32, false),
+        ]));
+        Ok(LgBindData {
+            entries,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -401,24 +405,21 @@ impl VTab for ListGraphsVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.entries.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.entries.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let names: Vec<&str> = bind.entries.iter().take(n).map(|e| e.0.as_str()).collect();
-        let nodes: Vec<i32> = bind.entries.iter().take(n).map(|e| e.1 as i32).collect();
-        let edges: Vec<i32> = bind.entries.iter().take(n).map(|e| e.2 as i32).collect();
-        let directed: Vec<i32> = bind.entries.iter().take(n).map(|e| e.3 as i32).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("nodes", DataType::Int32, false),
-            Field::new("edges", DataType::Int32, false),
-            Field::new("directed", DataType::Int32, false),
-        ]));
+        let slice = &bind.entries[offset..offset + n];
+        let names: Vec<&str> = slice.iter().map(|e| e.0.as_str()).collect();
+        let nodes: Vec<i32> = slice.iter().map(|e| e.1 as i32).collect();
+        let edges: Vec<i32> = slice.iter().map(|e| e.2 as i32).collect();
+        let directed: Vec<i32> = slice.iter().map(|e| e.3 as i32).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(StringArray::from(names)),
                 Arc::new(Int32Array::from(nodes)),
@@ -427,7 +428,8 @@ impl VTab for ListGraphsVTab {
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -559,6 +561,8 @@ struct CcInitData {
 #[repr(C)]
 struct CcBindData {
     components: Vec<(i32, i32)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct ConnectedComponentsVTab;
@@ -595,7 +599,15 @@ impl VTab for ConnectedComponentsVTab {
             "component_id",
             LogicalTypeHandle::from(LogicalTypeId::Integer),
         );
-        Ok(CcBindData { components })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Int32, false),
+            Field::new("component_id", DataType::Int32, false),
+        ]));
+        Ok(CcBindData {
+            components,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -612,27 +624,27 @@ impl VTab for ConnectedComponentsVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.components.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.components.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let nodes: Vec<i32> = bind.components.iter().take(n).map(|r| r.0).collect();
-        let comps: Vec<i32> = bind.components.iter().take(n).map(|r| r.1).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("component_id", DataType::Int32, false),
-        ]));
+        let slice = &bind.components[offset..offset + n];
+        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+        let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(Int32Array::from(nodes)),
                 Arc::new(Int32Array::from(comps)),
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -653,6 +665,8 @@ struct PrInitData {
 #[repr(C)]
 struct PrBindData {
     scores: Vec<(i32, f64)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct PageRankVTab;
@@ -683,7 +697,15 @@ impl VTab for PageRankVTab {
 
         bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Double));
-        Ok(PrBindData { scores: result })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Int32, false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        Ok(PrBindData {
+            scores: result,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -700,27 +722,27 @@ impl VTab for PageRankVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.scores.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.scores.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let nodes: Vec<i32> = bind.scores.iter().take(n).map(|r| r.0).collect();
-        let scores: Vec<f64> = bind.scores.iter().take(n).map(|r| r.1).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("score", DataType::Float64, false),
-        ]));
+        let slice = &bind.scores[offset..offset + n];
+        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+        let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(Int32Array::from(nodes)),
                 Arc::new(Float64Array::from(scores)),
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -745,6 +767,8 @@ struct BcInitData {
 #[repr(C)]
 struct BcBindData {
     scores: Vec<(i32, f64)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct BetweennessCentralityVTab;
@@ -807,7 +831,15 @@ impl VTab for BetweennessCentralityVTab {
 
         bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Double));
-        Ok(BcBindData { scores })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Int32, false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        Ok(BcBindData {
+            scores,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -824,27 +856,27 @@ impl VTab for BetweennessCentralityVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.scores.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.scores.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let nodes: Vec<i32> = bind.scores.iter().take(n).map(|r| r.0).collect();
-        let scores: Vec<f64> = bind.scores.iter().take(n).map(|r| r.1).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("score", DataType::Float64, false),
-        ]));
+        let slice = &bind.scores[offset..offset + n];
+        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+        let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(Int32Array::from(nodes)),
                 Arc::new(Float64Array::from(scores)),
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -865,6 +897,8 @@ struct SccInitData {
 #[repr(C)]
 struct SccBindData {
     components: Vec<(i32, i32)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct SccVTab;
@@ -889,7 +923,15 @@ impl VTab for SccVTab {
 
         bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("scc_id", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        Ok(SccBindData { components })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("node", DataType::Int32, false),
+            Field::new("scc_id", DataType::Int32, false),
+        ]));
+        Ok(SccBindData {
+            components,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -906,27 +948,27 @@ impl VTab for SccVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.components.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.components.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let nodes: Vec<i32> = bind.components.iter().take(n).map(|r| r.0).collect();
-        let comps: Vec<i32> = bind.components.iter().take(n).map(|r| r.1).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("scc_id", DataType::Int32, false),
-        ]));
+        let slice = &bind.components[offset..offset + n];
+        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+        let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(Int32Array::from(nodes)),
                 Arc::new(Int32Array::from(comps)),
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -947,6 +989,8 @@ struct MstInitData {
 #[repr(C)]
 struct MstBindData {
     edges: Vec<(i32, i32, f64)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
 }
 
 struct MstVTab;
@@ -984,7 +1028,16 @@ impl VTab for MstVTab {
         bind.add_result_column("src", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("dst", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
-        Ok(MstBindData { edges })
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int32, false),
+            Field::new("dst", DataType::Int32, false),
+            Field::new("weight", DataType::Float64, false),
+        ]));
+        Ok(MstBindData {
+            edges,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -1001,22 +1054,20 @@ impl VTab for MstVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.edges.len().min(2048);
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.edges.len().saturating_sub(offset);
+        let n = remaining.min(2048);
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
-        let srcs: Vec<i32> = bind.edges.iter().take(n).map(|e| e.0).collect();
-        let dsts: Vec<i32> = bind.edges.iter().take(n).map(|e| e.1).collect();
-        let weights: Vec<f64> = bind.edges.iter().take(n).map(|e| e.2).collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("src", DataType::Int32, false),
-            Field::new("dst", DataType::Int32, false),
-            Field::new("weight", DataType::Float64, false),
-        ]));
+        let slice = &bind.edges[offset..offset + n];
+        let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
+        let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
+        let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
         let batch = RecordBatch::try_new(
-            schema,
+            bind.schema.clone(),
             vec![
                 Arc::new(Int32Array::from(srcs)),
                 Arc::new(Int32Array::from(dsts)),
@@ -1024,7 +1075,8 @@ impl VTab for MstVTab {
             ],
         )?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
