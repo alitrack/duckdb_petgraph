@@ -1,18 +1,13 @@
-use arrow::{
-    array::{Float64Array, Int32Array, RecordBatch, StringArray},
-    datatypes::{DataType, Field, Schema},
-};
-use duckdb::{
-    core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
-    vtab::{arrow::record_batch_to_duckdb_data_chunk, BindInfo, InitInfo, TableFunctionInfo, VTab},
-    Connection, Result,
-};
 use petgraph::{
     algo,
     data::Element,
     graph::{DiGraph, NodeIndex, UnGraph},
     visit::{Dfs, EdgeRef},
+};
+use quack_rs::{
+    prelude::*,
+    table::TableFunctionBuilder,
+    types::TypeId,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -49,16 +44,8 @@ static GRAPH_REGISTRY: LazyLock<RwLock<HashMap<String, CachedGraph>>> =
 // ═══════════════════════════════════════════════
 
 type EdgeList = Vec<(i32, i32, f64)>;
-type DiGraphParts = (
-    DiGraph<(), f64>,
-    HashMap<i32, NodeIndex>,
-    HashMap<NodeIndex, i32>,
-);
-type UnGraphParts = (
-    UnGraph<(), f64>,
-    HashMap<i32, NodeIndex>,
-    HashMap<NodeIndex, i32>,
-);
+type DiGraphParts = (DiGraph<(), f64>, HashMap<i32, NodeIndex>, HashMap<NodeIndex, i32>);
+type UnGraphParts = (UnGraph<(), f64>, HashMap<i32, NodeIndex>, HashMap<NodeIndex, i32>);
 
 fn parse_edges(raw: &str) -> std::result::Result<EdgeList, Box<dyn Error>> {
     let s = raw.trim();
@@ -69,20 +56,15 @@ fn parse_edges(raw: &str) -> std::result::Result<EdgeList, Box<dyn Error>> {
     if inner.is_empty() {
         return Ok(Vec::new());
     }
-
     let mut edges = Vec::new();
     let mut depth = 0;
     let mut current = String::new();
     for ch in inner.chars() {
         match ch {
             '(' => {
-                if depth == 0 {
-                    current.clear();
-                }
+                if depth == 0 { current.clear(); }
                 depth += 1;
-                if depth > 1 {
-                    current.push(ch);
-                }
+                if depth > 1 { current.push(ch); }
             }
             ')' => {
                 depth -= 1;
@@ -90,46 +72,22 @@ fn parse_edges(raw: &str) -> std::result::Result<EdgeList, Box<dyn Error>> {
                     let cleaned = current.trim();
                     let parts: Vec<&str> = cleaned.splitn(3, ',').collect();
                     if parts.len() < 2 {
-                        return Err(
-                            format!("edge: expected (src,dst[,weight]), got ({cleaned})").into(),
-                        );
+                        return Err(format!("edge: expected (src,dst[,weight]), got ({cleaned})").into());
                     }
                     let src: i32 = parts[0].trim().parse()?;
                     let dst: i32 = parts[1].trim().parse()?;
-                    let weight: f64 = if parts.len() >= 3 {
-                        parts[2].trim().parse()?
-                    } else {
-                        1.0
-                    };
+                    let weight: f64 = if parts.len() >= 3 { parts[2].trim().parse()? } else { 1.0 };
                     edges.push((src, dst, weight));
-                } else {
-                    current.push(ch);
-                }
+                } else { current.push(ch); }
             }
-            ',' => {
-                if depth == 0 {
-                    // skip
-                } else {
-                    current.push(ch);
-                }
-            }
+            ',' => { if depth != 0 { current.push(ch); } }
             _ => current.push(ch),
         }
     }
     Ok(edges)
 }
 
-fn parse_int(raw: &str) -> std::result::Result<i32, Box<dyn Error>> {
-    Ok(raw.trim().parse()?)
-}
-
-fn build_digraph(
-    edges: &[(i32, i32, f64)],
-) -> (
-    DiGraph<(), f64>,
-    HashMap<i32, NodeIndex>,
-    HashMap<NodeIndex, i32>,
-) {
+fn build_digraph(edges: &[(i32, i32, f64)]) -> DiGraphParts {
     let mut g = DiGraph::<(), f64>::new();
     let mut id_to_ni: HashMap<i32, NodeIndex> = HashMap::new();
     for (src, dst, w) in edges {
@@ -141,13 +99,7 @@ fn build_digraph(
     (g, id_to_ni, ni_to_id)
 }
 
-fn build_undigraph(
-    edges: &[(i32, i32, f64)],
-) -> (
-    UnGraph<(), f64>,
-    HashMap<i32, NodeIndex>,
-    HashMap<NodeIndex, i32>,
-) {
+fn build_undigraph(edges: &[(i32, i32, f64)]) -> UnGraphParts {
     let mut g = UnGraph::<(), f64>::new_undirected();
     let mut id_to_ni: HashMap<i32, NodeIndex> = HashMap::new();
     for (src, dst, w) in edges {
@@ -159,21 +111,12 @@ fn build_undigraph(
     (g, id_to_ni, ni_to_id)
 }
 
-/// Resolve a string param to a directed graph — either by parsing edges,
-/// or by looking up `@name` in the registry.
 fn resolve_digraph(param: &str) -> std::result::Result<DiGraphParts, Box<dyn Error>> {
     if let Some(name) = param.strip_prefix('@') {
         let reg = GRAPH_REGISTRY.read().map_err(|e| e.to_string())?;
         match reg.get(name) {
-            Some(CachedGraph::Directed {
-                graph,
-                id_to_ni,
-                ni_to_id,
-                ..
-            }) => Ok((
-                (**graph).clone(),
-                (**id_to_ni).clone(),
-                (**ni_to_id).clone(),
+            Some(CachedGraph::Directed { graph, id_to_ni, ni_to_id, .. }) => Ok((
+                (**graph).clone(), (**id_to_ni).clone(), (**ni_to_id).clone(),
             )),
             Some(_) => Err(format!("graph '@{name}' is not a directed graph").into()),
             None => Err(format!("graph '@{name}' not found").into()),
@@ -188,15 +131,8 @@ fn resolve_undigraph(param: &str) -> std::result::Result<UnGraphParts, Box<dyn E
     if let Some(name) = param.strip_prefix('@') {
         let reg = GRAPH_REGISTRY.read().map_err(|e| e.to_string())?;
         match reg.get(name) {
-            Some(CachedGraph::Undirected {
-                graph,
-                id_to_ni,
-                ni_to_id,
-                ..
-            }) => Ok((
-                (**graph).clone(),
-                (**id_to_ni).clone(),
-                (**ni_to_id).clone(),
+            Some(CachedGraph::Undirected { graph, id_to_ni, ni_to_id, .. }) => Ok((
+                (**graph).clone(), (**id_to_ni).clone(), (**ni_to_id).clone(),
             )),
             Some(_) => Err(format!("graph '@{name}' is not an undirected graph").into()),
             None => Err(format!("graph '@{name}' not found").into()),
@@ -208,1181 +144,575 @@ fn resolve_undigraph(param: &str) -> std::result::Result<UnGraphParts, Box<dyn E
 }
 
 // ═══════════════════════════════════════════════
-// petgraph_build_graph(name, edges_str, directed)
+// FFI helpers for writing to DuckDB vectors
 // ═══════════════════════════════════════════════
 
-#[repr(C)]
-struct BgInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+use libduckdb_sys::{
+    duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size,
+    duckdb_vector_assign_string_element_len, duckdb_vector_get_data, idx_t,
+};
 
-#[repr(C)]
-struct BgBindData {
-    name: String,
-    node_count: usize,
-    edge_count: usize,
-    directed: bool,
-}
-
-struct BuildGraphVTab;
-
-impl VTab for BuildGraphVTab {
-    type BindData = BgBindData;
-    type InitData = BgInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let pc = bind.get_parameter_count();
-        if pc < 3 {
-            return Err(
-                "petgraph_build_graph: expected 3 params (name, edges_str, directed)".into(),
-            );
-        }
-        let name = bind.get_parameter(0).to_string();
-        let edges_str = bind.get_parameter(1).to_string();
-        let directed: i32 = parse_int(&bind.get_parameter(2).to_string())?;
-
-        let edges = parse_edges(&edges_str)?;
-
-        let cached = if directed != 0 {
-            let (g, id_to_ni, ni_to_id) = build_digraph(&edges);
-            let nc = g.node_count();
-            let ec = g.edge_count();
-            CachedGraph::Directed {
-                graph: Arc::new(g),
-                id_to_ni: Arc::new(id_to_ni),
-                ni_to_id: Arc::new(ni_to_id),
-                node_count: nc,
-                edge_count: ec,
-            }
-        } else {
-            let (g, id_to_ni, ni_to_id) = build_undigraph(&edges);
-            let nc = g.node_count();
-            let ec = g.edge_count();
-            CachedGraph::Undirected {
-                graph: Arc::new(g),
-                id_to_ni: Arc::new(id_to_ni),
-                ni_to_id: Arc::new(ni_to_id),
-                node_count: nc,
-                edge_count: ec,
-            }
-        };
-
-        let nc = match &cached {
-            CachedGraph::Directed { node_count, .. } => *node_count,
-            CachedGraph::Undirected { node_count, .. } => *node_count,
-        };
-        let ec = match &cached {
-            CachedGraph::Directed { edge_count, .. } => *edge_count,
-            CachedGraph::Undirected { edge_count, .. } => *edge_count,
-        };
-
-        let mut reg = GRAPH_REGISTRY.write().map_err(|e| e.to_string())?;
-        reg.insert(name.clone(), cached);
-
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("nodes", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("edges", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("directed", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        Ok(BgBindData {
-            name,
-            node_count: nc,
-            edge_count: ec,
-            directed: directed != 0,
-        })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(BgInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let bind = func.get_bind_data();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("nodes", DataType::Int32, false),
-            Field::new("edges", DataType::Int32, false),
-            Field::new("directed", DataType::Int32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![bind.name.as_str()])),
-                Arc::new(Int32Array::from(vec![bind.node_count as i32])),
-                Arc::new(Int32Array::from(vec![bind.edge_count as i32])),
-                Arc::new(Int32Array::from(vec![bind.directed as i32])),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        ])
+unsafe fn write_i32_col(chunk: duckdb_data_chunk, col: usize, data: &[i32], n: usize) {
+    let vec = duckdb_data_chunk_get_vector(chunk, col as idx_t);
+    let ptr = duckdb_vector_get_data(vec).cast::<i32>();
+    for (i, &v) in data.iter().enumerate().take(n) {
+        *ptr.add(i) = v;
     }
 }
 
-// ═══════════════════════════════════════════════
-// petgraph_list_graphs()
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct LgInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct LgBindData {
-    entries: Vec<(String, usize, usize, bool)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct ListGraphsVTab;
-
-impl VTab for ListGraphsVTab {
-    type BindData = LgBindData;
-    type InitData = LgInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let reg = GRAPH_REGISTRY.read().map_err(|e| e.to_string())?;
-        let mut entries = Vec::new();
-        for (name, g) in reg.iter() {
-            match g {
-                CachedGraph::Directed {
-                    node_count,
-                    edge_count,
-                    ..
-                } => entries.push((name.clone(), *node_count, *edge_count, true)),
-                CachedGraph::Undirected {
-                    node_count,
-                    edge_count,
-                    ..
-                } => entries.push((name.clone(), *node_count, *edge_count, false)),
-            }
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("nodes", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("edges", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("directed", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("nodes", DataType::Int32, false),
-            Field::new("edges", DataType::Int32, false),
-            Field::new("directed", DataType::Int32, false),
-        ]));
-        Ok(LgBindData {
-            entries,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
-        })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(LgInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.entries.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.entries[offset..offset + n];
-        let names: Vec<&str> = slice.iter().map(|e| e.0.as_str()).collect();
-        let nodes: Vec<i32> = slice.iter().map(|e| e.1 as i32).collect();
-        let edges: Vec<i32> = slice.iter().map(|e| e.2 as i32).collect();
-        let directed: Vec<i32> = slice.iter().map(|e| e.3 as i32).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(StringArray::from(names)),
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Int32Array::from(edges)),
-                Arc::new(Int32Array::from(directed)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        None
+unsafe fn write_f64_col(chunk: duckdb_data_chunk, col: usize, data: &[f64], n: usize) {
+    let vec = duckdb_data_chunk_get_vector(chunk, col as idx_t);
+    let ptr = duckdb_vector_get_data(vec).cast::<f64>();
+    for (i, &v) in data.iter().enumerate().take(n) {
+        *ptr.add(i) = v;
     }
 }
 
-// ═══════════════════════════════════════════════
-// petgraph_shortest_path(graph, from, to)
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct SpInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct SpBindData {
-    path_nodes: Vec<i32>,
-    total_weight: f64,
-}
-
-struct ShortestPathVTab;
-
-impl VTab for ShortestPathVTab {
-    type BindData = SpBindData;
-    type InitData = SpInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let pc = bind.get_parameter_count();
-        if pc < 3 {
-            return Err("petgraph_shortest_path: expected 3 params (graph, from, to)".into());
-        }
-        let (g, id_to_ni, ni_to_id) = resolve_digraph(&bind.get_parameter(0).to_string())?;
-        let from: i32 = parse_int(&bind.get_parameter(1).to_string())?;
-        let to: i32 = parse_int(&bind.get_parameter(2).to_string())?;
-
-        let from_ni = id_to_ni.get(&from).ok_or(format!(
-            "petgraph_shortest_path: node '{from}' not in graph"
-        ))?;
-        let to_ni = id_to_ni
-            .get(&to)
-            .ok_or(format!("petgraph_shortest_path: node '{to}' not in graph"))?;
-
-        let dist = algo::dijkstra(&g, *from_ni, Some(*to_ni), |e| *e.weight());
-        let total_weight = *dist.get(to_ni).unwrap_or(&f64::INFINITY);
-        let mut path_nodes = Vec::new();
-        if total_weight.is_finite() {
-            let path: Vec<NodeIndex> =
-                algo::astar(&g, *from_ni, |n| n == *to_ni, |e| *e.weight(), |_| 0.0)
-                    .map(|(_, path)| path)
-                    .unwrap_or_default();
-            path_nodes = path
-                .iter()
-                .map(|n| ni_to_id.get(n).copied().unwrap_or(-1))
-                .collect();
-        }
-
-        bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
-        Ok(SpBindData {
-            path_nodes,
-            total_weight,
-        })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(SpInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let bind = func.get_bind_data();
-
-        let path_str = if bind.path_nodes.is_empty() {
-            "[]".to_string()
-        } else {
-            format!(
-                "[{}]",
-                bind.path_nodes
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("path", DataType::Utf8, false),
-            Field::new("weight", DataType::Float64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![path_str])),
-                Arc::new(Float64Array::from(vec![bind.total_weight])),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        ])
-    }
-}
-
-// ═══════════════════════════════════════════════
-// petgraph_connected_components(graph)
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct CcInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct CcBindData {
-    components: Vec<(i32, i32)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct ConnectedComponentsVTab;
-
-impl VTab for ConnectedComponentsVTab {
-    type BindData = CcBindData;
-    type InitData = CcInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_connected_components: expected 1 param (graph)".into());
-        }
-        let (g, _, ni_to_id) = resolve_undigraph(&bind.get_parameter(0).to_string())?;
-
-        let mut components = Vec::new();
-        let mut visited = vec![false; g.node_count()];
-        let mut comp_id = 0;
-        for start in g.node_indices() {
-            if visited[start.index()] {
-                continue;
-            }
-            let mut dfs = Dfs::new(&g, start);
-            while let Some(n) = dfs.next(&g) {
-                if !visited[n.index()] {
-                    visited[n.index()] = true;
-                    components.push((ni_to_id.get(&n).copied().unwrap_or(-1), comp_id));
-                }
-            }
-            comp_id += 1;
-        }
-
-        bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column(
-            "component_id",
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
+unsafe fn write_varchar_col(chunk: duckdb_data_chunk, col: usize, data: &[String], n: usize) {
+    let vec = duckdb_data_chunk_get_vector(chunk, col as idx_t);
+    for (i, s) in data.iter().enumerate().take(n) {
+        duckdb_vector_assign_string_element_len(
+            vec,
+            i as idx_t,
+            s.as_ptr().cast::<std::os::raw::c_char>(),
+            s.len() as idx_t,
         );
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("component_id", DataType::Int32, false),
-        ]));
-        Ok(CcBindData {
-            components,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+    }
+}
+
+// ═══════════════════════════════════════════════
+// 1. petgraph_build_graph
+// ═══════════════════════════════════════════════
+
+struct BuildGraphState { name: String, node_count: usize, edge_count: usize, directed: bool, done: bool }
+
+fn build_petgraph_build_graph() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_build_graph")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Integer)
+        .with_state::<BuildGraphState, _>(|bind| {
+            if bind.parameter_count() < 3 {
+                return Err(ExtensionError::new("petgraph_build_graph: expected 3 params (name, edges_str, directed)"));
+            }
+            let name = unsafe { bind.get_parameter_value(0) }.as_str_or("").to_string();
+            let edges_str = unsafe { bind.get_parameter_value(1) }.as_str_or("").to_string();
+            let directed = unsafe { bind.get_parameter_value(2) }.as_i64_or(0) != 0;
+            let edges = parse_edges(&edges_str).map_err(|e| ExtensionError::new(&e.to_string()))?;
+
+            let cached = if directed {
+                let (g, id_to_ni, ni_to_id) = build_digraph(&edges);
+                CachedGraph::Directed { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: edges.len(), edge_count: edges.len() }
+            } else {
+                let (g, id_to_ni, ni_to_id) = build_undigraph(&edges);
+                CachedGraph::Undirected { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: 0, edge_count: edges.len() }
+            };
+            let nc = match &cached { CachedGraph::Directed { graph: g, .. } => g.node_count(), CachedGraph::Undirected { graph: g, .. } => g.node_count() };
+            let ec = match &cached { CachedGraph::Directed { edge_count, .. } => *edge_count, CachedGraph::Undirected { edge_count, .. } => *edge_count };
+            let mut reg = GRAPH_REGISTRY.write().map_err(|e| ExtensionError::new(&e.to_string()))?;
+            reg.insert(name.clone(), cached);
+            bind.add_result_column("name", TypeId::Varchar);
+            bind.add_result_column("nodes", TypeId::Integer);
+            bind.add_result_column("edges", TypeId::Integer);
+            bind.add_result_column("directed", TypeId::Integer);
+            Ok(BuildGraphState { name, node_count: nc, edge_count: ec, directed, done: false })
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(CcInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.components.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.components[offset..offset + n];
-        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
-        let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Int32Array::from(comps)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-}
-
-// ═══════════════════════════════════════════════
-// petgraph_pagerank(graph, alpha, iterations)
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct PrInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct PrBindData {
-    scores: Vec<(i32, f64)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct PageRankVTab;
-
-impl VTab for PageRankVTab {
-    type BindData = PrBindData;
-    type InitData = PrInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let pc = bind.get_parameter_count();
-        if pc < 3 {
-            return Err("petgraph_pagerank: expected 3 params (graph, alpha, iterations)".into());
-        }
-        let (g, _, ni_to_id) = resolve_digraph(&bind.get_parameter(0).to_string())?;
-        let alpha: f64 = bind.get_parameter(1).to_string().parse()?;
-        let iterations: usize = bind.get_parameter(2).to_string().parse()?;
-
-        let scores = algo::page_rank(&g, alpha, iterations);
-        let mut result: Vec<(i32, f64)> = scores
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let ni = NodeIndex::new(i);
-                (ni_to_id.get(&ni).copied().unwrap_or(i as i32), *s)
-            })
-            .collect();
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("score", DataType::Float64, false),
-        ]));
-        Ok(PrBindData {
-            scores: result,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+        .scan(|state, chunk| {
+            if state.done { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            state.done = true;
+            let raw = unsafe { chunk.as_raw() };
+            unsafe { write_varchar_col(raw, 0, &[state.name.clone()], 1) };
+            unsafe { write_i32_col(raw, 1, &[state.node_count as i32], 1) };
+            unsafe { write_i32_col(raw, 2, &[state.edge_count as i32], 1) };
+            unsafe { write_i32_col(raw, 3, &[state.directed as i32], 1) };
+            unsafe { duckdb_data_chunk_set_size(raw, 1) };
+            Ok(())
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(PrInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.scores.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.scores[offset..offset + n];
-        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
-        let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Float64Array::from(scores)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Double),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        ])
-    }
+        .build()
 }
 
 // ═══════════════════════════════════════════════
-// petgraph_betweenness_centrality(graph)
+// 2. petgraph_list_graphs
 // ═══════════════════════════════════════════════
 
-#[repr(C)]
-struct BcInitData {
-    done: std::sync::atomic::AtomicBool,
+struct ListGraphsState { entries: Vec<(String, usize, usize, bool)>, offset: usize }
+
+fn build_petgraph_list_graphs() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_list_graphs")
+        .with_state::<ListGraphsState, _>(|bind| {
+            let reg = GRAPH_REGISTRY.read().map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let mut entries = Vec::new();
+            for (name, g) in reg.iter() {
+                match g {
+                    CachedGraph::Directed { node_count, edge_count, .. } => entries.push((name.clone(), *node_count, *edge_count, true)),
+                    CachedGraph::Undirected { node_count, edge_count, .. } => entries.push((name.clone(), *node_count, *edge_count, false)),
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            bind.add_result_column("name", TypeId::Varchar);
+            bind.add_result_column("nodes", TypeId::Integer);
+            bind.add_result_column("edges", TypeId::Integer);
+            bind.add_result_column("directed", TypeId::Integer);
+            Ok(ListGraphsState { entries, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.entries.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.entries[state.offset..state.offset + n];
+            let names: Vec<String> = slice.iter().map(|e| e.0.clone()).collect();
+            let nodes: Vec<i32> = slice.iter().map(|e| e.1 as i32).collect();
+            let edges: Vec<i32> = slice.iter().map(|e| e.2 as i32).collect();
+            let directed: Vec<i32> = slice.iter().map(|e| e.3 as i32).collect();
+            unsafe { write_varchar_col(raw, 0, &names, n) };
+            unsafe { write_i32_col(raw, 1, &nodes, n) };
+            unsafe { write_i32_col(raw, 2, &edges, n) };
+            unsafe { write_i32_col(raw, 3, &directed, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
 }
 
-#[repr(C)]
-struct BcBindData {
-    scores: Vec<(i32, f64)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
+// ═══════════════════════════════════════════════
+// 3. petgraph_drop_graph
+// ═══════════════════════════════════════════════
+
+struct DropGraphState { name: String, existed: bool, done: bool }
+
+fn build_petgraph_drop_graph() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_drop_graph")
+        .param(TypeId::Varchar)
+        .with_state::<DropGraphState, _>(|bind| {
+            if bind.parameter_count() < 1 {
+                return Err(ExtensionError::new("petgraph_drop_graph: expected 1 param (name)"));
+            }
+            let name = unsafe { bind.get_parameter_value(0) }.as_str_or("").to_string();
+            let mut reg = GRAPH_REGISTRY.write().map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let existed = reg.remove(&name).is_some();
+            bind.add_result_column("name", TypeId::Varchar);
+            bind.add_result_column("dropped", TypeId::Integer);
+            Ok(DropGraphState { name, existed, done: false })
+        })
+        .scan(|state, chunk| {
+            if state.done { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            state.done = true;
+            let raw = unsafe { chunk.as_raw() };
+            unsafe { write_varchar_col(raw, 0, &[state.name.clone()], 1) };
+            unsafe { write_i32_col(raw, 1, &[state.existed as i32], 1) };
+            unsafe { duckdb_data_chunk_set_size(raw, 1) };
+            Ok(())
+        })
+        .build()
 }
 
-struct BetweennessCentralityVTab;
+// ═══════════════════════════════════════════════
+// 4. petgraph_shortest_path
+// ═══════════════════════════════════════════════
 
-impl VTab for BetweennessCentralityVTab {
-    type BindData = BcBindData;
-    type InitData = BcInitData;
+struct SpState { path: String, weight: f64, done: bool }
 
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_betweenness_centrality: expected 1 param (graph)".into());
-        }
-        let (g, _, ni_to_id) = resolve_undigraph(&bind.get_parameter(0).to_string())?;
+fn build_petgraph_shortest_path() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_shortest_path")
+        .param(TypeId::Varchar).param(TypeId::Integer).param(TypeId::Integer)
+        .with_state::<SpState, _>(|bind| {
+            if bind.parameter_count() < 3 {
+                return Err(ExtensionError::new("petgraph_shortest_path: expected 3 params (graph, from, to)"));
+            }
+            let graph_str = unsafe { bind.get_parameter_value(0) }.as_str_or("").to_string();
+            let from = unsafe { bind.get_parameter_value(1) }.as_i64_or(0) as i32;
+            let to = unsafe { bind.get_parameter_value(2) }.as_i64_or(0) as i32;
+            let (g, id_to_ni, ni_to_id) = resolve_digraph(&graph_str).map_err(|e| ExtensionError::new(&e.to_string()))?;
 
-        // Brandes' algorithm for betweenness centrality (not in petgraph 0.7)
-        let n = g.node_count();
-        let mut cb = vec![0.0f64; n];
-        for s in g.node_indices() {
-            let mut stack = Vec::new();
-            let mut pred: Vec<Vec<NodeIndex>> = vec![Vec::new(); n];
-            let mut sigma = vec![0u64; n];
-            let mut dist = vec![-1i32; n];
-            let mut q = VecDeque::new();
-            sigma[s.index()] = 1;
-            dist[s.index()] = 0;
-            q.push_back(s);
-            while let Some(v) = q.pop_front() {
-                stack.push(v);
-                for w in g.neighbors(v) {
-                    if dist[w.index()] < 0 {
-                        dist[w.index()] = dist[v.index()] + 1;
-                        q.push_back(w);
-                    }
-                    if dist[w.index()] == dist[v.index()] + 1 {
-                        sigma[w.index()] += sigma[v.index()];
-                        pred[w.index()].push(v);
+            let from_ni = *id_to_ni.get(&from).ok_or_else(|| ExtensionError::new(&format!("node '{from}' not in graph")))?;
+            let to_ni = *id_to_ni.get(&to).ok_or_else(|| ExtensionError::new(&format!("node '{to}' not in graph")))?;
+
+            let dist = algo::dijkstra(&g, from_ni, Some(to_ni), |e| *e.weight());
+            let total_weight = *dist.get(&to_ni).unwrap_or(&f64::INFINITY);
+            let mut path = "[]".to_string();
+            if total_weight.is_finite() {
+                if let Some((_, nodes)) = algo::astar(&g, from_ni, |n| n == to_ni, |e| *e.weight(), |_| 0.0) {
+                    let ids: Vec<String> = nodes.iter().map(|n| ni_to_id.get(n).copied().unwrap_or(-1).to_string()).collect();
+                    path = format!("[{}]", ids.join(","));
+                }
+            }
+            bind.add_result_column("path", TypeId::Varchar);
+            bind.add_result_column("weight", TypeId::Double);
+            Ok(SpState { path, weight: total_weight, done: false })
+        })
+        .scan(|state, chunk| {
+            if state.done { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            state.done = true;
+            let raw = unsafe { chunk.as_raw() };
+            unsafe { write_varchar_col(raw, 0, &[state.path.clone()], 1) };
+            unsafe { write_f64_col(raw, 1, &[state.weight], 1) };
+            unsafe { duckdb_data_chunk_set_size(raw, 1) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 5. petgraph_connected_components
+// ═══════════════════════════════════════════════
+
+struct CcState { data: Vec<(i32, i32)>, offset: usize }
+
+fn build_petgraph_connected_components() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_connected_components")
+        .param(TypeId::Varchar)
+        .with_state::<CcState, _>(|bind| {
+            let param = unsafe { bind.get_parameter_value(0) }.as_str_or("").to_string();
+            let (g, _, ni_to_id) = resolve_undigraph(&param).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let mut data = Vec::new();
+            let mut visited = vec![false; g.node_count()];
+            let mut comp_id = 0;
+            for start in g.node_indices() {
+                if visited[start.index()] { continue; }
+                let mut dfs = Dfs::new(&g, start);
+                while let Some(n) = dfs.next(&g) {
+                    if !visited[n.index()] {
+                        visited[n.index()] = true;
+                        data.push((ni_to_id.get(&n).copied().unwrap_or(-1), comp_id));
                     }
                 }
+                comp_id += 1;
             }
-            let mut delta = vec![0.0f64; n];
-            while let Some(w) = stack.pop() {
-                for &v in &pred[w.index()] {
-                    delta[v.index()] += (sigma[v.index()] as f64 / sigma[w.index()] as f64)
-                        * (1.0 + delta[w.index()]);
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("component_id", TypeId::Integer);
+            Ok(CcState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_i32_col(raw, 1, &comps, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 6. petgraph_pagerank
+// ═══════════════════════════════════════════════
+
+struct PrState { data: Vec<(i32, f64)>, offset: usize }
+
+fn build_petgraph_pagerank() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_pagerank")
+        .param(TypeId::Varchar).param(TypeId::Double).param(TypeId::Integer)
+        .with_state::<PrState, _>(|bind| {
+            if bind.parameter_count() < 3 {
+                return Err(ExtensionError::new("petgraph_pagerank: expected 3 params (graph, alpha, iterations)"));
+            }
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let alpha = unsafe { bind.get_parameter_value(1) }.as_f64_or(0.85);
+            let iterations = unsafe { bind.get_parameter_value(2) }.as_i64_or(20) as usize;
+            let scores = algo::page_rank(&g, alpha, iterations);
+            let mut data: Vec<(i32, f64)> = scores.iter().enumerate()
+                .map(|(i, s)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), *s) })
+                .collect();
+            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("score", TypeId::Double);
+            Ok(PrState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &scores, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 7. petgraph_betweenness_centrality
+// ═══════════════════════════════════════════════
+
+struct BcState { data: Vec<(i32, f64)>, offset: usize }
+
+fn build_petgraph_betweenness_centrality() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_betweenness_centrality")
+        .param(TypeId::Varchar)
+        .with_state::<BcState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_undigraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let n = g.node_count();
+            let mut cb = vec![0.0f64; n];
+            for s in g.node_indices() {
+                let mut stack = Vec::new();
+                let mut pred: Vec<Vec<NodeIndex>> = vec![Vec::new(); n];
+                let mut sigma = vec![0u64; n];
+                let mut dist = vec![-1i32; n];
+                let mut q = VecDeque::new();
+                sigma[s.index()] = 1;
+                dist[s.index()] = 0;
+                q.push_back(s);
+                while let Some(v) = q.pop_front() {
+                    stack.push(v);
+                    for w in g.neighbors(v) {
+                        if dist[w.index()] < 0 { dist[w.index()] = dist[v.index()] + 1; q.push_back(w); }
+                        if dist[w.index()] == dist[v.index()] + 1 { sigma[w.index()] += sigma[v.index()]; pred[w.index()].push(v); }
+                    }
                 }
-                if w != s {
-                    cb[w.index()] += delta[w.index()];
+                let mut delta = vec![0.0f64; n];
+                while let Some(w) = stack.pop() {
+                    for &v in &pred[w.index()] {
+                        delta[v.index()] += (sigma[v.index()] as f64 / sigma[w.index()] as f64) * (1.0 + delta[w.index()]);
+                    }
+                    if w != s { cb[w.index()] += delta[w.index()]; }
                 }
             }
-        }
-        let mut scores: Vec<(i32, f64)> = cb
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let ni = NodeIndex::new(i);
-                (ni_to_id.get(&ni).copied().unwrap_or(i as i32), s)
-            })
-            .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("score", DataType::Float64, false),
-        ]));
-        Ok(BcBindData {
-            scores,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+            let mut data: Vec<(i32, f64)> = cb.iter().enumerate()
+                .map(|(i, &s)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), s) })
+                .collect();
+            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("score", TypeId::Double);
+            Ok(BcState { data, offset: 0 })
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(BcInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.scores.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.scores[offset..offset + n];
-        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
-        let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Float64Array::from(scores)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &scores, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
 }
 
 // ═══════════════════════════════════════════════
-// petgraph_scc(graph) — Tarjan's strongly connected components
+// 8. petgraph_scc (Tarjan)
 // ═══════════════════════════════════════════════
 
-#[repr(C)]
-struct SccInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+struct SccState { data: Vec<(i32, i32)>, offset: usize }
 
-#[repr(C)]
-struct SccBindData {
-    components: Vec<(i32, i32)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct SccVTab;
-
-impl VTab for SccVTab {
-    type BindData = SccBindData;
-    type InitData = SccInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_scc: expected 1 param (graph)".into());
-        }
-        let (g, _, ni_to_id) = resolve_digraph(&bind.get_parameter(0).to_string())?;
-
-        let sccs = algo::tarjan_scc(&g);
-        let mut components = Vec::new();
-        for (comp_id, scc) in sccs.iter().enumerate() {
-            for n in scc {
-                components.push((ni_to_id.get(n).copied().unwrap_or(-1), comp_id as i32));
+fn build_petgraph_scc() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_scc")
+        .param(TypeId::Varchar)
+        .with_state::<SccState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let sccs = algo::tarjan_scc(&g);
+            let mut data = Vec::new();
+            for (comp_id, scc) in sccs.iter().enumerate() {
+                for n in scc { data.push((ni_to_id.get(n).copied().unwrap_or(-1), comp_id as i32)); }
             }
-        }
-
-        bind.add_result_column("node", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("scc_id", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("node", DataType::Int32, false),
-            Field::new("scc_id", DataType::Int32, false),
-        ]));
-        Ok(SccBindData {
-            components,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("scc_id", TypeId::Integer);
+            Ok(SccState { data, offset: 0 })
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(SccInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.components.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.components[offset..offset + n];
-        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
-        let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Int32Array::from(comps)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-}
-
-// ═══════════════════════════════════════════════
-// petgraph_mst(graph) — Kruskal's minimum spanning tree
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct MstInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct MstBindData {
-    edges: Vec<(i32, i32, f64)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct MstVTab;
-
-impl VTab for MstVTab {
-    type BindData = MstBindData;
-    type InitData = MstInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_mst: expected 1 param (graph)".into());
-        }
-        let (g, _, ni_to_id) = resolve_undigraph(&bind.get_parameter(0).to_string())?;
-
-        let mst_edges = algo::min_spanning_tree(&g);
-        let edges: Vec<(i32, i32, f64)> = mst_edges
-            .filter_map(|el| match el {
-                Element::Edge {
-                    source,
-                    target,
-                    weight,
-                } => {
-                    let s = NodeIndex::new(source);
-                    let t = NodeIndex::new(target);
-                    Some((
-                        ni_to_id.get(&s).copied().unwrap_or(-1),
-                        ni_to_id.get(&t).copied().unwrap_or(-1),
-                        weight,
-                    ))
-                }
-                Element::Node { .. } => None,
-            })
-            .collect();
-
-        bind.add_result_column("src", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("dst", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("src", DataType::Int32, false),
-            Field::new("dst", DataType::Int32, false),
-            Field::new("weight", DataType::Float64, false),
-        ]));
-        Ok(MstBindData {
-            edges,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_i32_col(raw, 1, &comps, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(MstInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.edges.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.edges[offset..offset + n];
-        let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
-        let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
-        let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(srcs)),
-                Arc::new(Int32Array::from(dsts)),
-                Arc::new(Float64Array::from(weights)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
+        .build()
 }
 
 // ═══════════════════════════════════════════════
-// petgraph_drop_graph(name)
+// 9. petgraph_mst (Kruskal)
 // ═══════════════════════════════════════════════
 
-#[repr(C)]
-struct DgInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+struct MstState { data: Vec<(i32, i32, f64)>, offset: usize }
 
-#[repr(C)]
-struct DgBindData {
-    name: String,
-    existed: bool,
-}
-
-struct DropGraphVTab;
-
-impl VTab for DropGraphVTab {
-    type BindData = DgBindData;
-    type InitData = DgInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_drop_graph: expected 1 param (name)".into());
-        }
-        let name = bind.get_parameter(0).to_string();
-        let mut reg = GRAPH_REGISTRY.write().map_err(|e| e.to_string())?;
-        let existed = reg.remove(&name).is_some();
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("dropped", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        Ok(DgBindData { name, existed })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(DgInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let bind = func.get_bind_data();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("dropped", DataType::Int32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![bind.name.as_str()])),
-                Arc::new(Int32Array::from(vec![bind.existed as i32])),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
+fn build_petgraph_mst() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_mst")
+        .param(TypeId::Varchar)
+        .with_state::<MstState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_undigraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let data: Vec<(i32, i32, f64)> = algo::min_spanning_tree(&g)
+                .filter_map(|el| match el {
+                    Element::Edge { source, target, weight } => {
+                        let s = NodeIndex::new(source); let t = NodeIndex::new(target);
+                        Some((ni_to_id.get(&s).copied().unwrap_or(-1), ni_to_id.get(&t).copied().unwrap_or(-1), weight))
+                    }
+                    Element::Node { .. } => None,
+                }).collect();
+            bind.add_result_column("src", TypeId::Integer);
+            bind.add_result_column("dst", TypeId::Integer);
+            bind.add_result_column("weight", TypeId::Double);
+            Ok(MstState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
+            let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
+            let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
+            unsafe { write_i32_col(raw, 0, &srcs, n) };
+            unsafe { write_i32_col(raw, 1, &dsts, n) };
+            unsafe { write_f64_col(raw, 2, &weights, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
 }
 
 // ═══════════════════════════════════════════════
-// petgraph_neighbors(graph, node) — outgoing neighbors
+// 10. petgraph_edges
 // ═══════════════════════════════════════════════
 
-#[repr(C)]
-struct NbInitData {
-    done: std::sync::atomic::AtomicBool,
+struct EdState { data: Vec<(i32, i32, f64)>, offset: usize }
+
+fn build_petgraph_edges() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_edges")
+        .param(TypeId::Varchar)
+        .with_state::<EdState, _>(|bind| {
+            let param = unsafe { bind.get_parameter_value(0) }.as_str_or("").to_string();
+            let data: Vec<(i32, i32, f64)> = if let Ok((g, _, ni_to_id)) = resolve_digraph(&param) {
+                g.edge_references().map(|e| {
+                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
+                    (ni_to_id.get(&u).copied().unwrap_or(-1), ni_to_id.get(&v).copied().unwrap_or(-1), *e.weight())
+                }).collect()
+            } else if let Ok((g, _, ni_to_id)) = resolve_undigraph(&param) {
+                g.edge_references().map(|e| {
+                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
+                    (ni_to_id.get(&u).copied().unwrap_or(-1), ni_to_id.get(&v).copied().unwrap_or(-1), *e.weight())
+                }).collect()
+            } else {
+                return Err(ExtensionError::new("petgraph_edges: invalid graph (not inline edges nor @cached)"));
+            };
+            bind.add_result_column("src", TypeId::Integer);
+            bind.add_result_column("dst", TypeId::Integer);
+            bind.add_result_column("weight", TypeId::Double);
+            Ok(EdState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
+            let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
+            let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
+            unsafe { write_i32_col(raw, 0, &srcs, n) };
+            unsafe { write_i32_col(raw, 1, &dsts, n) };
+            unsafe { write_f64_col(raw, 2, &weights, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
 }
 
-#[repr(C)]
-struct NbBindData {
-    neighbors: Vec<(i32, f64)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
+// ═══════════════════════════════════════════════
+// 11. petgraph_neighbors
+// ═══════════════════════════════════════════════
 
-struct NeighborsVTab;
+struct NbState { data: Vec<(i32, f64)>, offset: usize }
 
-impl VTab for NeighborsVTab {
-    type BindData = NbBindData;
-    type InitData = NbInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 2 {
-            return Err("petgraph_neighbors: expected 2 params (graph, node)".into());
-        }
-        let (g, id_to_ni, ni_to_id) = resolve_digraph(&bind.get_parameter(0).to_string())?;
-        let node: i32 = parse_int(&bind.get_parameter(1).to_string())?;
-        let ni = id_to_ni
-            .get(&node)
-            .ok_or(format!("petgraph_neighbors: node '{node}' not in graph"))?;
-
-        let mut neighbors: Vec<(i32, f64)> = g
-            .edges(*ni)
-            .map(|e| {
+fn build_petgraph_neighbors() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_neighbors")
+        .param(TypeId::Varchar).param(TypeId::Integer)
+        .with_state::<NbState, _>(|bind| {
+            if bind.parameter_count() < 2 {
+                return Err(ExtensionError::new("petgraph_neighbors: expected 2 params (graph, node)"));
+            }
+            let (g, id_to_ni, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let node = unsafe { bind.get_parameter_value(1) }.as_i64_or(0) as i32;
+            let ni = *id_to_ni.get(&node).ok_or_else(|| ExtensionError::new(&format!("node '{node}' not in graph")))?;
+            let mut data: Vec<(i32, f64)> = g.edges(ni).map(|e| {
                 let target = g.edge_endpoints(e.id()).unwrap().1;
                 (ni_to_id.get(&target).copied().unwrap_or(-1), *e.weight())
-            })
-            .collect();
-        neighbors.sort_by(|a, b| a.0.cmp(&b.0));
-
-        bind.add_result_column("neighbor", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("neighbor", DataType::Int32, false),
-            Field::new("weight", DataType::Float64, false),
-        ]));
-        Ok(NbBindData {
-            neighbors,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+            }).collect();
+            data.sort_by(|a, b| a.0.cmp(&b.0));
+            bind.add_result_column("neighbor", TypeId::Integer);
+            bind.add_result_column("weight", TypeId::Double);
+            Ok(NbState { data, offset: 0 })
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(NbInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.neighbors.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.neighbors[offset..offset + n];
-        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
-        let weights: Vec<f64> = slice.iter().map(|r| r.1).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(nodes)),
-                Arc::new(Float64Array::from(weights)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        ])
-    }
-}
-
-// ═══════════════════════════════════════════════
-// petgraph_edges(graph) — enumerate all edges
-// ═══════════════════════════════════════════════
-
-#[repr(C)]
-struct EdInitData {
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[repr(C)]
-struct EdBindData {
-    edges: Vec<(i32, i32, f64)>,
-    offset: std::sync::atomic::AtomicUsize,
-    schema: Arc<arrow::datatypes::Schema>,
-}
-
-struct EdgesVTab;
-
-impl VTab for EdgesVTab {
-    type BindData = EdBindData;
-    type InitData = EdInitData;
-
-    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        if bind.get_parameter_count() < 1 {
-            return Err("petgraph_edges: expected 1 param (graph)".into());
-        }
-        let param = bind.get_parameter(0).to_string();
-        // Try directed first, fall back to undirected
-        let edges: Vec<(i32, i32, f64)> = if let Ok((g, _, ni_to_id)) = resolve_digraph(&param) {
-            g.edge_references()
-                .map(|e| {
-                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
-                    (
-                        ni_to_id.get(&u).copied().unwrap_or(-1),
-                        ni_to_id.get(&v).copied().unwrap_or(-1),
-                        *e.weight(),
-                    )
-                })
-                .collect()
-        } else if let Ok((g, _, ni_to_id)) = resolve_undigraph(&param) {
-            g.edge_references()
-                .map(|e| {
-                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
-                    (
-                        ni_to_id.get(&u).copied().unwrap_or(-1),
-                        ni_to_id.get(&v).copied().unwrap_or(-1),
-                        *e.weight(),
-                    )
-                })
-                .collect()
-        } else {
-            return Err("petgraph_edges: invalid graph (not inline edges and not @cached)".into());
-        };
-
-        bind.add_result_column("src", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("dst", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("src", DataType::Int32, false),
-            Field::new("dst", DataType::Int32, false),
-            Field::new("weight", DataType::Float64, false),
-        ]));
-        Ok(EdBindData {
-            edges,
-            offset: std::sync::atomic::AtomicUsize::new(0),
-            schema,
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let weights: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &weights, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
         })
-    }
-
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(EdInitData { done: false.into() })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let init = func.get_init_data();
-        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind = func.get_bind_data();
-        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = bind.edges.len().saturating_sub(offset);
-        let n = remaining.min(2048);
-        if n == 0 {
-            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-        let slice = &bind.edges[offset..offset + n];
-        let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
-        let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
-        let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
-        let batch = RecordBatch::try_new(
-            bind.schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(srcs)),
-                Arc::new(Int32Array::from(dsts)),
-                Arc::new(Float64Array::from(weights)),
-            ],
-        )?;
-        record_batch_to_duckdb_data_chunk(&batch, output)?;
-        bind.offset
-            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
+        .build()
 }
 
 // ═══════════════════════════════════════════════
 // Entrypoint
 // ═══════════════════════════════════════════════
 
-#[duckdb_entrypoint_c_api(ext_name = "petgraph_ext")]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<BuildGraphVTab>("petgraph_build_graph")?;
-    con.register_table_function::<ListGraphsVTab>("petgraph_list_graphs")?;
-    con.register_table_function::<ShortestPathVTab>("petgraph_shortest_path")?;
-    con.register_table_function::<ConnectedComponentsVTab>("petgraph_connected_components")?;
-    con.register_table_function::<PageRankVTab>("petgraph_pagerank")?;
-    con.register_table_function::<BetweennessCentralityVTab>("petgraph_betweenness_centrality")?;
-    con.register_table_function::<SccVTab>("petgraph_scc")?;
-    con.register_table_function::<MstVTab>("petgraph_mst")?;
-    con.register_table_function::<DropGraphVTab>("petgraph_drop_graph")?;
-    con.register_table_function::<NeighborsVTab>("petgraph_neighbors")?;
-    con.register_table_function::<EdgesVTab>("petgraph_edges")?;
+use libduckdb_sys::{
+    duckdb_extension_access, duckdb_extension_info,
+};
+use quack_rs::{
+    connection::Registrar,
+    entry_point::init_extension_v2,
+};
+
+fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
+    macro_rules! reg {
+        ($builder:expr) => { unsafe { reg.register_table($builder?) }?; };
+    }
+    reg!(build_petgraph_build_graph());
+    reg!(build_petgraph_list_graphs());
+    reg!(build_petgraph_drop_graph());
+    reg!(build_petgraph_shortest_path());
+    reg!(build_petgraph_connected_components());
+    reg!(build_petgraph_pagerank());
+    reg!(build_petgraph_betweenness_centrality());
+    reg!(build_petgraph_scc());
+    reg!(build_petgraph_mst());
+    reg!(build_petgraph_edges());
+    reg!(build_petgraph_neighbors());
     Ok(())
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn petgraph_ext_init_c_api(
+    info: duckdb_extension_info,
+    access: *const duckdb_extension_access,
+) -> bool {
+    unsafe { init_extension_v2(info, access, quack_rs::DUCKDB_API_VERSION, |con| register_all(con)) }
+}
+
+// ═══════════════════════════════════════════════
+// WASM re-export
+// ═══════════════════════════════════════════════
+
+// Exported by wasm_lib.rs
