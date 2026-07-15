@@ -12,7 +12,7 @@ use petgraph::{
     algo,
     data::Element,
     graph::{DiGraph, NodeIndex, UnGraph},
-    visit::Dfs,
+    visit::{Dfs, EdgeRef},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -1086,6 +1086,288 @@ impl VTab for MstVTab {
 }
 
 // ═══════════════════════════════════════════════
+// petgraph_drop_graph(name)
+// ═══════════════════════════════════════════════
+
+#[repr(C)]
+struct DgInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+struct DgBindData {
+    name: String,
+    existed: bool,
+}
+
+struct DropGraphVTab;
+
+impl VTab for DropGraphVTab {
+    type BindData = DgBindData;
+    type InitData = DgInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        if bind.get_parameter_count() < 1 {
+            return Err("petgraph_drop_graph: expected 1 param (name)".into());
+        }
+        let name = bind.get_parameter(0).to_string();
+        let mut reg = GRAPH_REGISTRY.write().map_err(|e| e.to_string())?;
+        let existed = reg.remove(&name).is_some();
+        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("dropped", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        Ok(DgBindData { name, existed })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(DgInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("dropped", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![bind.name.as_str()])),
+                Arc::new(Int32Array::from(vec![bind.existed as i32])),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+// ═══════════════════════════════════════════════
+// petgraph_neighbors(graph, node) — outgoing neighbors
+// ═══════════════════════════════════════════════
+
+#[repr(C)]
+struct NbInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+struct NbBindData {
+    neighbors: Vec<(i32, f64)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+struct NeighborsVTab;
+
+impl VTab for NeighborsVTab {
+    type BindData = NbBindData;
+    type InitData = NbInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        if bind.get_parameter_count() < 2 {
+            return Err("petgraph_neighbors: expected 2 params (graph, node)".into());
+        }
+        let (g, id_to_ni, ni_to_id) = resolve_digraph(&bind.get_parameter(0).to_string())?;
+        let node: i32 = parse_int(&bind.get_parameter(1).to_string())?;
+        let ni = id_to_ni
+            .get(&node)
+            .ok_or(format!("petgraph_neighbors: node '{node}' not in graph"))?;
+
+        let mut neighbors: Vec<(i32, f64)> = g
+            .edges(*ni)
+            .map(|e| {
+                let target = g.edge_endpoints(e.id()).unwrap().1;
+                (ni_to_id.get(&target).copied().unwrap_or(-1), *e.weight())
+            })
+            .collect();
+        neighbors.sort_by(|a, b| a.0.cmp(&b.0));
+
+        bind.add_result_column("neighbor", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("neighbor", DataType::Int32, false),
+            Field::new("weight", DataType::Float64, false),
+        ]));
+        Ok(NbBindData {
+            neighbors,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(NbInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind = func.get_bind_data();
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.neighbors.len().saturating_sub(offset);
+        let n = remaining.min(2048);
+        if n == 0 {
+            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let slice = &bind.neighbors[offset..offset + n];
+        let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+        let weights: Vec<f64> = slice.iter().map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(nodes)),
+                Arc::new(Float64Array::from(weights)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
+// ═══════════════════════════════════════════════
+// petgraph_edges(graph) — enumerate all edges
+// ═══════════════════════════════════════════════
+
+#[repr(C)]
+struct EdInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+struct EdBindData {
+    edges: Vec<(i32, i32, f64)>,
+    offset: std::sync::atomic::AtomicUsize,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+struct EdgesVTab;
+
+impl VTab for EdgesVTab {
+    type BindData = EdBindData;
+    type InitData = EdInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        if bind.get_parameter_count() < 1 {
+            return Err("petgraph_edges: expected 1 param (graph)".into());
+        }
+        let param = bind.get_parameter(0).to_string();
+        // Try directed first, fall back to undirected
+        let edges: Vec<(i32, i32, f64)> = if let Ok((g, _, ni_to_id)) = resolve_digraph(&param) {
+            g.edge_references()
+                .map(|e| {
+                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
+                    (
+                        ni_to_id.get(&u).copied().unwrap_or(-1),
+                        ni_to_id.get(&v).copied().unwrap_or(-1),
+                        *e.weight(),
+                    )
+                })
+                .collect()
+        } else if let Ok((g, _, ni_to_id)) = resolve_undigraph(&param) {
+            g.edge_references()
+                .map(|e| {
+                    let (u, v) = g.edge_endpoints(e.id()).unwrap();
+                    (
+                        ni_to_id.get(&u).copied().unwrap_or(-1),
+                        ni_to_id.get(&v).copied().unwrap_or(-1),
+                        *e.weight(),
+                    )
+                })
+                .collect()
+        } else {
+            return Err("petgraph_edges: invalid graph (not inline edges and not @cached)".into());
+        };
+
+        bind.add_result_column("src", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("dst", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("weight", LogicalTypeHandle::from(LogicalTypeId::Double));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int32, false),
+            Field::new("dst", DataType::Int32, false),
+            Field::new("weight", DataType::Float64, false),
+        ]));
+        Ok(EdBindData {
+            edges,
+            offset: std::sync::atomic::AtomicUsize::new(0),
+            schema,
+        })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(EdInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind = func.get_bind_data();
+        let offset = bind.offset.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = bind.edges.len().saturating_sub(offset);
+        let n = remaining.min(2048);
+        if n == 0 {
+            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let slice = &bind.edges[offset..offset + n];
+        let srcs: Vec<i32> = slice.iter().map(|e| e.0).collect();
+        let dsts: Vec<i32> = slice.iter().map(|e| e.1).collect();
+        let weights: Vec<f64> = slice.iter().map(|e| e.2).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(srcs)),
+                Arc::new(Int32Array::from(dsts)),
+                Arc::new(Float64Array::from(weights)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        bind.offset
+            .store(offset + n, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+// ═══════════════════════════════════════════════
 // Entrypoint
 // ═══════════════════════════════════════════════
 
@@ -1099,5 +1381,8 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<BetweennessCentralityVTab>("petgraph_betweenness_centrality")?;
     con.register_table_function::<SccVTab>("petgraph_scc")?;
     con.register_table_function::<MstVTab>("petgraph_mst")?;
+    con.register_table_function::<DropGraphVTab>("petgraph_drop_graph")?;
+    con.register_table_function::<NeighborsVTab>("petgraph_neighbors")?;
+    con.register_table_function::<EdgesVTab>("petgraph_edges")?;
     Ok(())
 }

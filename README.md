@@ -39,6 +39,9 @@ SELECT * FROM petgraph_build_graph(
 |---|---|---|
 | `petgraph_build_graph(name, edges, directed)` | name, `[(src,dst,weight),...]`, 1=directed | (name, nodes, edges, directed) |
 | `petgraph_list_graphs()` | — | (name, nodes, edges, directed) |
+| `petgraph_drop_graph(name)` | name | (name, dropped) |
+| `petgraph_edges(graph)` | graph (inline or @name) | (src, dst, weight) |
+| `petgraph_neighbors(graph, node)` | graph, node (directed only) | (neighbor, weight) |
 
 ### Algorithms (all accept inline edges or `@name` for cached graphs)
 
