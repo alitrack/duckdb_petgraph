@@ -25,6 +25,7 @@ jobs:
             target/release/libpetgraph_ext.so \
             -o petgraph_ext.duckdb_extension
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: petgraph_ext-linux-x86_64
           path: petgraph_ext.duckdb_extension
@@ -49,6 +50,7 @@ jobs:
             target/release/libpetgraph_ext.dylib \
             -o petgraph_ext.duckdb_extension
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: petgraph_ext-macos-arm64
           path: petgraph_ext.duckdb_extension
