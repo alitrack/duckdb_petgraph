@@ -17,7 +17,7 @@ def detect_platform():
     elif system == "Darwin":
         return "osx_arm64" if machine == "arm64" else "osx_amd64"
     elif system == "Windows":
-        return "windows_amd64"
+        return "windows_amd64" if machine in ("AMD64", "x86_64") else "windows_arm64"
     return "linux_amd64"  # fallback
 
 

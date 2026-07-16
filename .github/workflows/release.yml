@@ -35,6 +35,9 @@ jobs:
           - os: macos-latest
             name: osx-arm64
             lib: target/release/libpetgraph_ext.dylib
+          - os: windows-latest
+            name: windows-x86_64
+            lib: target/release/petgraph_ext.dll
 
     runs-on: ${{ matrix.os }}
 
@@ -43,6 +46,7 @@ jobs:
 
       - name: Extract version from tag
         id: version
+        shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +55,7 @@ jobs:
         run: cargo build --release
 
       - name: Generate extension
+        shell: bash
         run: |
           python3 scripts/metadata.py \
             --extension-version "${{ steps.version.outputs.VERSION }}" \

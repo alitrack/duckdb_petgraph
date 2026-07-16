@@ -51,3 +51,26 @@ jobs:
         run: |
           file petgraph_ext.duckdb_extension
           ls -lh petgraph_ext.duckdb_extension
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          VER=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+      - name: Build release
+        run: cargo build --release
+      - name: Generate extension
+        run: |
+          python3 scripts/metadata.py `
+            --extension-version "${{ steps.version.outputs.version }}" `
+            target/release/petgraph_ext.dll `
+            -o petgraph_ext.duckdb_extension
+      - name: Verify extension
+        run: |
+          dir petgraph_ext.duckdb_extension
