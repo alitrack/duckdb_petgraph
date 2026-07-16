@@ -2,27 +2,54 @@ name: Build
 
 on: [push, pull_request]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.duckdb_extension
+      - name: Extract version
+        id: version
+        run: |
+          VER=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+      - name: Build release
+        run: cargo build --release
+      - name: Generate extension
+        run: |
+          python3 scripts/metadata.py \
+            --extension-version "${{ steps.version.outputs.version }}" \
+            target/release/libpetgraph_ext.so \
+            -o petgraph_ext.duckdb_extension
       - uses: actions/upload-artifact@v4
         with:
           name: petgraph_ext-linux-x86_64
           path: petgraph_ext.duckdb_extension
+          retention-days: 1
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: python3 scripts/metadata.py target/release/libpetgraph_ext.dylib -o petgraph_ext.duckdb_extension
+      - name: Extract version
+        id: version
+        run: |
+          VER=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+      - name: Build release
+        run: cargo build --release
+      - name: Generate extension
+        run: |
+          python3 scripts/metadata.py \
+            --extension-version "${{ steps.version.outputs.version }}" \
+            target/release/libpetgraph_ext.dylib \
+            -o petgraph_ext.duckdb_extension
       - uses: actions/upload-artifact@v4
         with:
           name: petgraph_ext-macos-arm64
           path: petgraph_ext.duckdb_extension
+          retention-days: 1
