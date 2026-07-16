@@ -24,12 +24,10 @@ jobs:
             --extension-version "${{ steps.version.outputs.version }}" \
             target/release/libpetgraph_ext.so \
             -o petgraph_ext.duckdb_extension
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: petgraph_ext-linux-x86_64
-          path: petgraph_ext.duckdb_extension
-          retention-days: 1
+      - name: Verify extension
+        run: |
+          file petgraph_ext.duckdb_extension
+          ls -lh petgraph_ext.duckdb_extension
 
   build-macos:
     runs-on: macos-latest
@@ -49,9 +47,7 @@ jobs:
             --extension-version "${{ steps.version.outputs.version }}" \
             target/release/libpetgraph_ext.dylib \
             -o petgraph_ext.duckdb_extension
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: petgraph_ext-macos-arm64
-          path: petgraph_ext.duckdb_extension
-          retention-days: 1
+      - name: Verify extension
+        run: |
+          file petgraph_ext.duckdb_extension
+          ls -lh petgraph_ext.duckdb_extension
