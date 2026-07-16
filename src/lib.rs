@@ -584,7 +584,290 @@ fn build_petgraph_mst() -> Result<TableFunctionBuilder, ExtensionError> {
 }
 
 // ═══════════════════════════════════════════════
-// 10. petgraph_edges
+// 10. petgraph_closeness_centrality
+// ═══════════════════════════════════════════════
+
+fn closeness_centrality(g: &DiGraph<(), f64>) -> Vec<f64> {
+    let n = g.node_count();
+    let mut closeness = vec![0.0; n];
+    if n <= 1 { return closeness; }
+    let idx_to_node: Vec<NodeIndex> = g.node_indices().collect();
+    let node_to_idx: HashMap<NodeIndex, usize> = idx_to_node.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    for (start_idx, &start) in idx_to_node.iter().enumerate() {
+        let mut dist: Vec<Option<usize>> = vec![None; n];
+        let mut queue = VecDeque::new();
+        dist[start_idx] = Some(0);
+        queue.push_back(start);
+        while let Some(v) = queue.pop_front() {
+            let dv = dist[node_to_idx[&v]].unwrap();
+            for w in g.neighbors(v) {
+                let wi = node_to_idx[&w];
+                if dist[wi].is_none() { dist[wi] = Some(dv + 1); queue.push_back(w); }
+            }
+        }
+        let sum: usize = dist.iter().filter_map(|&d| d).sum();
+        let reachable = dist.iter().filter(|&&d| d.is_some()).count();
+        if reachable > 1 && sum > 0 {
+            closeness[start_idx] = (reachable - 1) as f64 * (reachable - 1) as f64 / ((n - 1) as f64 * sum as f64);
+        }
+    }
+    closeness
+}
+
+struct ClState { data: Vec<(i32, f64)>, offset: usize }
+
+fn build_petgraph_closeness_centrality() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_closeness_centrality")
+        .param(TypeId::Varchar)
+        .with_state::<ClState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let scores = closeness_centrality(&g);
+            let mut data: Vec<(i32, f64)> = scores.iter().enumerate()
+                .map(|(i, &s)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), s) })
+                .collect();
+            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("centrality", TypeId::Double);
+            Ok(ClState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &scores, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 11. petgraph_eigenvector_centrality
+// ═══════════════════════════════════════════════
+
+fn eigenvector_centrality(g: &DiGraph<(), f64>, max_iter: usize, tolerance: f64) -> Vec<f64> {
+    let n = g.node_count();
+    if n == 0 { return Vec::new(); }
+    let idx_to_node: Vec<NodeIndex> = g.node_indices().collect();
+    let node_to_idx: HashMap<NodeIndex, usize> = idx_to_node.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let mut x = vec![1.0; n];
+    for _iter in 0..max_iter {
+        let mut x_new = vec![0.0; n];
+        for (i, node) in idx_to_node.iter().enumerate() {
+            for neighbor in g.neighbors(*node) {
+                x_new[i] += x[node_to_idx[&neighbor]];
+            }
+        }
+        let norm: f64 = x_new.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm < 1e-15 { break; }
+        for v in x_new.iter_mut() { *v /= norm; }
+        let diff: f64 = x.iter().zip(x_new.iter()).map(|(a, b)| (a - b).abs()).sum();
+        x = x_new;
+        if diff < tolerance { break; }
+    }
+    let max_val = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min_val = x.iter().cloned().fold(f64::INFINITY, f64::min);
+    if (max_val - min_val).abs() > 1e-10 {
+        x.iter_mut().for_each(|v| *v = (*v - min_val) / (max_val - min_val));
+    }
+    x
+}
+
+struct EvState { data: Vec<(i32, f64)>, offset: usize }
+
+fn build_petgraph_eigenvector_centrality() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_eigenvector_centrality")
+        .param(TypeId::Varchar).param(TypeId::Integer).param(TypeId::Double)
+        .with_state::<EvState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let max_iter = if bind.parameter_count() >= 2 { unsafe { bind.get_parameter_value(1) }.as_i64_or(100) as usize } else { 100 };
+            let tolerance = if bind.parameter_count() >= 3 { unsafe { bind.get_parameter_value(2) }.as_f64_or(1e-6) } else { 1e-6 };
+            let scores = eigenvector_centrality(&g, max_iter, tolerance);
+            let mut data: Vec<(i32, f64)> = scores.iter().enumerate()
+                .map(|(i, &s)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), s) })
+                .collect();
+            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("centrality", TypeId::Double);
+            Ok(EvState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let scores: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &scores, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 12. petgraph_louvain
+// ═══════════════════════════════════════════════
+
+fn louvain_community(g: &DiGraph<(), f64>) -> Vec<usize> {
+    let n = g.node_count();
+    if n == 0 { return Vec::new(); }
+    let m = g.edge_count() as f64;
+    if m < 1.0 { return (0..n).collect(); }
+    let idx_to_node: Vec<NodeIndex> = g.node_indices().collect();
+    let node_to_idx: HashMap<NodeIndex, usize> = idx_to_node.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for (i, node) in idx_to_node.iter().enumerate() {
+        for neighbor in g.neighbors(*node) {
+            if let Some(&ni) = node_to_idx.get(&neighbor) { adj[i].push((ni, 1.0)); }
+        }
+    }
+    let mut community: Vec<usize> = (0..n).collect();
+    for _pass in 0..20 {
+        let mut improved = false;
+        let mut comm_total = vec![0.0f64; n];
+        for (i, neighbors) in adj.iter().enumerate() {
+            for &(_j, w) in neighbors { comm_total[community[i]] += w; }
+        }
+        for i in 0..n {
+            let old_comm = community[i];
+            let mut comm_weight: HashMap<usize, f64> = HashMap::new();
+            let mut ki = 0.0f64;
+            for &(j, w) in &adj[i] { ki += w; *comm_weight.entry(community[j]).or_insert(0.0) += w; }
+            if ki == 0.0 { continue; }
+            let mut best_comm = old_comm;
+            let mut best_delta = 0.0f64;
+            let k_i_over_2m = ki / (2.0 * m);
+            for (&target_comm, &w_to_comm) in &comm_weight {
+                if target_comm == old_comm { continue; }
+                let sigma_tot = comm_total[target_comm];
+                let delta = (w_to_comm / m) - 2.0 * (sigma_tot / (2.0 * m)) * k_i_over_2m * 2.0;
+                if delta > best_delta { best_delta = delta; best_comm = target_comm; }
+            }
+            if best_comm != old_comm { community[i] = best_comm; improved = true; }
+        }
+        if !improved { break; }
+    }
+    let mut comm_map: HashMap<usize, usize> = HashMap::new();
+    let mut next_id = 0usize;
+    let mut result = vec![0usize; n];
+    for (i, &comm) in community.iter().enumerate() {
+        let compact = *comm_map.entry(comm).or_insert_with(|| { let id = next_id; next_id += 1; id });
+        result[i] = compact;
+    }
+    result
+}
+
+struct LvState { data: Vec<(i32, i32)>, offset: usize }
+
+fn build_petgraph_louvain() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_louvain")
+        .param(TypeId::Varchar)
+        .with_state::<LvState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let communities = louvain_community(&g);
+            let mut data: Vec<(i32, i32)> = communities.iter().enumerate()
+                .map(|(i, &c)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), c as i32) })
+                .collect();
+            data.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("community_id", TypeId::Integer);
+            Ok(LvState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let comps: Vec<i32> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_i32_col(raw, 1, &comps, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 13. petgraph_toposort
+// ═══════════════════════════════════════════════
+
+struct TsState { data: Vec<(i32, i32)>, offset: usize }
+
+fn build_petgraph_toposort() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_toposort")
+        .param(TypeId::Varchar)
+        .with_state::<TsState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let data = match algo::toposort(&g, None) {
+                Ok(order) => order.iter().enumerate()
+                    .map(|(pos, n)| (pos as i32, ni_to_id.get(n).copied().unwrap_or(-1)))
+                    .collect(),
+                Err(cycle) => {
+                    let node_id = ni_to_id.get(&cycle.node_id()).copied().unwrap_or(-1);
+                    return Err(ExtensionError::new(&format!("graph contains a cycle at node {node_id}")));
+                }
+            };
+            bind.add_result_column("position", TypeId::Integer);
+            bind.add_result_column("node", TypeId::Integer);
+            Ok(TsState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let positions: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let nodes: Vec<i32> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &positions, n) };
+            unsafe { write_i32_col(raw, 1, &nodes, n) };
+            state.offset += n;
+            unsafe { duckdb_data_chunk_set_size(raw, n as idx_t) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 14. petgraph_is_cyclic
+// ═══════════════════════════════════════════════
+
+struct CyState { is_cyclic: bool, done: bool }
+
+fn build_petgraph_is_cyclic() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_is_cyclic")
+        .param(TypeId::Varchar)
+        .with_state::<CyState, _>(|bind| {
+            let (g, _, _) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            bind.add_result_column("is_cyclic", TypeId::Integer);
+            Ok(CyState { is_cyclic: algo::is_cyclic_directed(&g), done: false })
+        })
+        .scan(|state, chunk| {
+            if state.done { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            state.done = true;
+            let raw = unsafe { chunk.as_raw() };
+            unsafe { write_i32_col(raw, 0, &[state.is_cyclic as i32], 1) };
+            unsafe { duckdb_data_chunk_set_size(raw, 1) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 15. petgraph_edges
 // ═══════════════════════════════════════════════
 
 struct EdState { data: Vec<(i32, i32, f64)>, offset: usize }
@@ -698,6 +981,11 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     reg!(build_petgraph_betweenness_centrality());
     reg!(build_petgraph_scc());
     reg!(build_petgraph_mst());
+    reg!(build_petgraph_closeness_centrality());
+    reg!(build_petgraph_eigenvector_centrality());
+    reg!(build_petgraph_louvain());
+    reg!(build_petgraph_toposort());
+    reg!(build_petgraph_is_cyclic());
     reg!(build_petgraph_edges());
     reg!(build_petgraph_neighbors());
     Ok(())
