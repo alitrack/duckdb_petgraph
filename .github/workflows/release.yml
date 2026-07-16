@@ -32,13 +32,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            name: linux-x86_64
+            platform: linux_amd64
             lib: target/release/libpetgraph_ext.so
           - os: macos-latest
-            name: osx-arm64
+            platform: osx_arm64
             lib: target/release/libpetgraph_ext.dylib
           - os: windows-latest
-            name: windows-x86_64
+            platform: windows_amd64
             lib: target/release/petgraph_ext.dll
 
     runs-on: ${{ matrix.os }}
@@ -57,15 +57,18 @@ jobs:
         run: cargo build --release
 
       - name: Generate extension
+        id: generate
         shell: bash
         run: |
+          EXT_FILE="petgraph_ext-${{ matrix.platform }}.duckdb_extension"
           python3 scripts/metadata.py \
             --extension-version "${{ steps.version.outputs.VERSION }}" \
             ${{ matrix.lib }} \
-            -o petgraph_ext.duckdb_extension
+            -o "$EXT_FILE"
+          echo "ext_file=$EXT_FILE" >> $GITHUB_OUTPUT
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: petgraph_ext.duckdb_extension
+          files: ${{ steps.generate.outputs.ext_file }}
