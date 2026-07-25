@@ -7,7 +7,7 @@ DuckDB extension for graph algorithms, powered by the [petgraph](https://github.
 ```sql
 LOAD 'petgraph_ext.duckdb_extension';
 
--- 1. Shortest path (Dijkstra + A*)
+-- 1. Shortest path (A*)
 SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2);
 -- → (path VARCHAR, weight DOUBLE): path='[0,1,2]', weight=3.5
 
@@ -61,22 +61,49 @@ SELECT * FROM petgraph_build_graph(
 
 ## Build
 
+### Quick build (macOS / Linux)
+
 ```bash
 git clone git@github.com:alitrack/duckdb_petgraph.git && cd duckdb_petgraph
 
 # macOS
 cargo build --release
-python3 scripts/metadata.py target/release/libpetgraph_ext.dylib -o petgraph_ext.duckdb_extension
+python3 scripts/metadata.py --extension-version "$(grep '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')" target/release/libpetgraph_ext.dylib -o petgraph_ext.duckdb_extension
 
 # Linux
 cargo build --release
-python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.duckdb_extension
+python3 scripts/metadata.py --extension-version "$(grep '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')" target/release/libpetgraph_ext.so -o petgraph_ext.duckdb_extension
+```
+
+### Makefile build (with extension-ci-tools)
+
+```bash
+git clone --recurse-submodules git@github.com:alitrack/duckdb_petgraph.git && cd duckdb_petgraph
+
+make configure    # set up venv, platform, extension version
+make release      # build + package as .duckdb_extension
+make test_release # run SQLLogicTest suite
+```
+
+```sql
+duckdb -unsigned -c "LOAD 'build/release/extension/petgraph_ext/petgraph_ext.duckdb_extension'; SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2);"
+```
+
+### Testing
+
+```bash
+# Run SQLLogicTest suite
+make test_release
+
+# Run smoke test (requires duckdb Python package)
+pip install duckdb
+duckdb -unsigned -c "LOAD 'petgraph_ext.duckdb_extension'; .read test/sql/petgraph.test"
 ```
 
 ## Roadmap
 
 - [x] `petgraph_build_graph()` + `petgraph_list_graphs()` — graph registry (`@name` syntax)
-- [x] `petgraph_shortest_path()` — Dijkstra with A\* path reconstruction
+- [x] `petgraph_shortest_path()` — A\* path reconstruction (single traversal)
 - [x] `petgraph_connected_components()` — DFS component labeling
 - [x] `petgraph_pagerank()` — PageRank with configurable alpha/iterations
 - [x] `petgraph_betweenness_centrality()` — Brandes' algorithm (hand-implemented, not in petgraph 0.7)
@@ -88,8 +115,9 @@ python3 scripts/metadata.py target/release/libpetgraph_ext.so -o petgraph_ext.du
 - [x] `petgraph_toposort()` — Topological sort (Kahns algorithm)
 - [x] `petgraph_is_cyclic()` — Directed cycle detection
 - [x] Multi-batch streaming — all multi-row functions stream across `func()` calls, no 2048-row ceiling
-- [ ] DuckDB Community Extension submission
+- [x] `description.yml` — Community Extension submission ready
+- [ ] Submit to [duckdb/community-extensions](https://github.com/duckdb/community-extensions)
 
 ## License
 
-MIT — matches petgraph (MIT/Apache-2.0) and duckdb-rs (MIT).
+MIT — matches petgraph (MIT/Apache-2.0) and quack-rs (MIT).

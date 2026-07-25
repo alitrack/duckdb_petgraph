@@ -28,6 +28,29 @@ jobs:
         run: |
           file petgraph_ext.duckdb_extension
           ls -lh petgraph_ext.duckdb_extension
+      - name: Smoke test
+        run: |
+          pip install duckdb
+          python3 -c "
+          import duckdb
+          con = duckdb.connect()
+          con.execute(\"LOAD 'petgraph_ext.duckdb_extension'\")
+          r = con.execute(\"SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2)\").fetchall()
+          print('shortest_path:', r)
+          assert r[0][1] == 3.5, f'Expected weight 3.5, got {r[0][1]}'
+          r = con.execute(\"SELECT * FROM petgraph_pagerank('[(0,1,1),(1,2,1),(2,0,1)]', 0.85, 20)\").fetchall()
+          print('pagerank:', r)
+          r = con.execute(\"SELECT * FROM petgraph_connected_components('[(0,1,1),(1,2,1),(3,4,1)]')\").fetchall()
+          print('connected_components:', r)
+          r = con.execute(\"SELECT * FROM petgraph_build_graph('smoke', '[(0,1,2.5),(1,2,1.0)]', 1)\").fetchall()
+          print('build_graph:', r)
+          assert r[0][0] == 'smoke' and r[0][1] == 3 and r[0][2] == 2, f'build failed: {r}'
+          r = con.execute(\"SELECT * FROM petgraph_list_graphs()\").fetchall()
+          print('list_graphs:', r)
+          r = con.execute(\"SELECT * FROM petgraph_drop_graph('smoke')\").fetchall()
+          print('drop_graph:', r)
+          print('All smoke tests passed')
+          "
 
   build-macos:
     runs-on: macos-latest
@@ -51,6 +74,18 @@ jobs:
         run: |
           file petgraph_ext.duckdb_extension
           ls -lh petgraph_ext.duckdb_extension
+      - name: Smoke test
+        run: |
+          pip install duckdb
+          python3 -c "
+          import duckdb
+          con = duckdb.connect()
+          con.execute(\"LOAD 'petgraph_ext.duckdb_extension'\")
+          r = con.execute(\"SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1.0),(0,2,5.0)]', 0, 2)\").fetchall()
+          assert r[0][1] == 3.5
+          r = con.execute(\"SELECT * FROM petgraph_pagerank('[(0,1,1),(1,2,1),(2,0,1)]', 0.85, 20)\").fetchall()
+          print('macOS smoke tests passed')
+          "
 
   build-windows:
     runs-on: windows-latest
@@ -74,3 +109,7 @@ jobs:
       - name: Verify extension
         run: |
           dir petgraph_ext.duckdb_extension
+      - name: Smoke test
+        run: |
+          pip install duckdb
+          python -c "import duckdb; con=duckdb.connect(); con.execute(\"LOAD 'petgraph_ext.duckdb_extension'\"); r=con.execute(\"SELECT * FROM petgraph_shortest_path('[(0,1,2.5),(1,2,1),(0,2,5)]', 0, 2)\").fetchall(); assert r[0][1]==3.5; print('Windows smoke test passed')"

@@ -198,15 +198,17 @@ fn build_petgraph_build_graph() -> Result<TableFunctionBuilder, ExtensionError> 
             let directed = unsafe { bind.get_parameter_value(2) }.as_i64_or(0) != 0;
             let edges = parse_edges(&edges_str).map_err(|e| ExtensionError::new(&e.to_string()))?;
 
-            let cached = if directed {
+            let (nc, ec, cached) = if directed {
                 let (g, id_to_ni, ni_to_id) = build_digraph(&edges);
-                CachedGraph::Directed { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: edges.len(), edge_count: edges.len() }
+                let nc = g.node_count();
+                let ec = g.edge_count();
+                (nc, ec, CachedGraph::Directed { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: nc, edge_count: ec })
             } else {
                 let (g, id_to_ni, ni_to_id) = build_undigraph(&edges);
-                CachedGraph::Undirected { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: 0, edge_count: edges.len() }
+                let nc = g.node_count();
+                let ec = g.edge_count();
+                (nc, ec, CachedGraph::Undirected { graph: Arc::new(g), id_to_ni: Arc::new(id_to_ni), ni_to_id: Arc::new(ni_to_id), node_count: nc, edge_count: ec })
             };
-            let nc = match &cached { CachedGraph::Directed { graph: g, .. } => g.node_count(), CachedGraph::Undirected { graph: g, .. } => g.node_count() };
-            let ec = match &cached { CachedGraph::Directed { edge_count, .. } => *edge_count, CachedGraph::Undirected { edge_count, .. } => *edge_count };
             let mut reg = GRAPH_REGISTRY.write().map_err(|e| ExtensionError::new(&e.to_string()))?;
             reg.insert(name.clone(), cached);
             bind.add_result_column("name", TypeId::Varchar);
@@ -327,15 +329,13 @@ fn build_petgraph_shortest_path() -> Result<TableFunctionBuilder, ExtensionError
             let from_ni = *id_to_ni.get(&from).ok_or_else(|| ExtensionError::new(&format!("node '{from}' not in graph")))?;
             let to_ni = *id_to_ni.get(&to).ok_or_else(|| ExtensionError::new(&format!("node '{to}' not in graph")))?;
 
-            let dist = algo::dijkstra(&g, from_ni, Some(to_ni), |e| *e.weight());
-            let total_weight = *dist.get(&to_ni).unwrap_or(&f64::INFINITY);
-            let mut path = "[]".to_string();
-            if total_weight.is_finite() {
-                if let Some((_, nodes)) = algo::astar(&g, from_ni, |n| n == to_ni, |e| *e.weight(), |_| 0.0) {
+            let (total_weight, path) = match algo::astar(&g, from_ni, |n| n == to_ni, |e| *e.weight(), |_| 0.0) {
+                Some((cost, nodes)) => {
                     let ids: Vec<String> = nodes.iter().map(|n| ni_to_id.get(n).copied().unwrap_or(-1).to_string()).collect();
-                    path = format!("[{}]", ids.join(","));
+                    (cost, format!("[{}]", ids.join(",")))
                 }
-            }
+                None => (f64::INFINITY, "[]".to_string()),
+            };
             bind.add_result_column("path", TypeId::Varchar);
             bind.add_result_column("weight", TypeId::Double);
             Ok(SpState { path, weight: total_weight, done: false })

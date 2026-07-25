@@ -11,7 +11,7 @@ USE_UNSTABLE_C_API=0
 TARGET_DUCKDB_VERSION=v1.2.0
 
 # Skip tests for now — add SQLLogicTest files later
-SKIP_TESTS=1
+SKIP_TESTS=0
 
 all: configure debug
 
