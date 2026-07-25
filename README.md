@@ -20,10 +20,26 @@ SELECT * FROM petgraph_pagerank('@my_graph', 0.85, 20);
 
 ### Feeding data from DuckDB tables
 
+**Method 1: LIST-typed (recommended — zero string serialization)**
+
 ```sql
 CREATE TABLE edges AS SELECT * FROM (VALUES (0,1,2.5), (1,2,1.0)) t(src, dst, weight);
 
--- Serialize → build → cache
+SET VARIABLE n  = (SELECT count(*) FROM edges);
+SET VARIABLE src = (SELECT list(src ORDER BY src) FROM edges);
+SET VARIABLE dst = (SELECT list(dst ORDER BY src) FROM edges);
+SET VARIABLE wgt = (SELECT list(weight ORDER BY src) FROM edges);
+
+SELECT * FROM petgraph_build_graph_list('g', getvariable('n')::INTEGER,
+    getvariable('src'), getvariable('dst'), getvariable('wgt'), 1);
+SELECT * FROM petgraph_shortest_path('@g', 0, 2);
+```
+
+**Method 2: string_agg (for quick inline use)**
+
+```sql
+CREATE TABLE edges AS SELECT * FROM (VALUES (0,1,2.5), (1,2,1.0)) t(src, dst, weight);
+
 SELECT * FROM petgraph_build_graph(
     'g',
     (SELECT '[' || string_agg('(' || src || ',' || dst || ',' || weight || ')', ',') || ']' FROM edges),
@@ -38,6 +54,7 @@ SELECT * FROM petgraph_build_graph(
 | Function | Parameters | Returns |
 |---|---|---|
 | `petgraph_build_graph(name, edges, directed)` | name, `[(src,dst,weight),...]`, 1=directed | (name, nodes, edges, directed) |
+| `petgraph_build_graph_list(name, n, src_list, dst_list, weight_list, directed)` | name, edge count, `LIST<INT>` src, `LIST<INT>` dst, `LIST<FLOAT>` weight, 1=directed | (name, nodes, edges, directed) |
 | `petgraph_list_graphs()` | — | (name, nodes, edges, directed) |
 | `petgraph_drop_graph(name)` | name | (name, dropped) |
 | `petgraph_edges(graph)` | graph (inline or @name) | (src, dst, weight) |
