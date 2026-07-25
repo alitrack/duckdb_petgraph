@@ -7,7 +7,7 @@ use petgraph::{
 use quack_rs::{
     prelude::*,
     table::TableFunctionBuilder,
-    types::TypeId,
+    types::{LogicalType, TypeId},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -149,6 +149,7 @@ fn resolve_undigraph(param: &str) -> std::result::Result<UnGraphParts, Box<dyn E
 
 use libduckdb_sys::{
     duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size,
+    duckdb_get_double, duckdb_get_int32, duckdb_get_list_child, duckdb_value,
     duckdb_vector_assign_string_element_len, duckdb_vector_get_data, idx_t,
 };
 
@@ -178,6 +179,30 @@ unsafe fn write_varchar_col(chunk: duckdb_data_chunk, col: usize, data: &[String
             s.len() as idx_t,
         );
     }
+}
+
+// ═══════════════════════════════════════════════
+// FFI helpers for reading LIST-typed parameters
+// ═══════════════════════════════════════════════
+
+/// Read the first `len` elements from a LIST<INT> parameter value.
+fn read_list_i32(val: duckdb_value, len: usize) -> Vec<i32> {
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let child = unsafe { duckdb_get_list_child(val, i as idx_t) };
+        result.push(unsafe { duckdb_get_int32(child) });
+    }
+    result
+}
+
+/// Read the first `len` elements from a LIST<FLOAT> parameter value.
+fn read_list_f64(val: duckdb_value, len: usize) -> Vec<f64> {
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let child = unsafe { duckdb_get_list_child(val, i as idx_t) };
+        result.push(unsafe { duckdb_get_double(child) });
+    }
+    result
 }
 
 // ═══════════════════════════════════════════════
@@ -957,6 +982,125 @@ fn build_petgraph_neighbors() -> Result<TableFunctionBuilder, ExtensionError> {
 }
 
 // ═══════════════════════════════════════════════
+// 17. petgraph_build_graph_list (LIST-typed, no string_agg)
+// ═══════════════════════════════════════════════
+
+fn build_petgraph_build_graph_list(
+) -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_build_graph_list")
+        .param(TypeId::Varchar)
+        .param(TypeId::Integer)
+        .param_logical(LogicalType::list(TypeId::Integer))
+        .param_logical(LogicalType::list(TypeId::Integer))
+        .param_logical(LogicalType::list(TypeId::Double))
+        .param(TypeId::Integer)
+        .with_state::<BuildGraphState, _>(|bind| {
+            if bind.parameter_count() < 6 {
+                return Err(ExtensionError::new(
+                    "petgraph_build_graph_list: expected 6 params (name, n_edges, src_list, dst_list, weight_list, directed)",
+                ));
+            }
+            let name = unsafe { bind.get_parameter_value(0) }
+                .as_str_or("")
+                .to_string();
+            let n_edges: usize = unsafe { bind.get_parameter_value(1) }.as_i64_or(0) as usize;
+            let directed =
+                unsafe { bind.get_parameter_value(5) }.as_i64_or(0) != 0;
+
+            if n_edges == 0 {
+                return Err(ExtensionError::new(
+                    "petgraph_build_graph_list: n_edges must be > 0",
+                ));
+            }
+
+            let srcs = read_list_i32(unsafe { bind.get_parameter(2) }, n_edges);
+            let dsts = read_list_i32(unsafe { bind.get_parameter(3) }, n_edges);
+            let wgts = read_list_f64(unsafe { bind.get_parameter(4) }, n_edges);
+
+            let n_edges = srcs.len().min(dsts.len()).min(wgts.len());
+            if n_edges == 0 {
+                return Err(ExtensionError::new(
+                    "petgraph_build_graph_list: empty edge lists",
+                ));
+            }
+            if srcs.len() != dsts.len() || srcs.len() != wgts.len() {
+                return Err(ExtensionError::new(&format!(
+                    "petgraph_build_graph_list: list length mismatch (src={}, dst={}, wgt={})",
+                    srcs.len(),
+                    dsts.len(),
+                    wgts.len()
+                )));
+            }
+
+            let edges: Vec<(i32, i32, f64)> = (0..n_edges)
+                .map(|i| (srcs[i], dsts[i], wgts[i]))
+                .collect();
+
+            let (nc, ec, cached) = if directed {
+                let (g, id_to_ni, ni_to_id) = build_digraph(&edges);
+                let nc = g.node_count();
+                let ec = g.edge_count();
+                (
+                    nc,
+                    ec,
+                    CachedGraph::Directed {
+                        graph: Arc::new(g),
+                        id_to_ni: Arc::new(id_to_ni),
+                        ni_to_id: Arc::new(ni_to_id),
+                        node_count: nc,
+                        edge_count: ec,
+                    },
+                )
+            } else {
+                let (g, id_to_ni, ni_to_id) = build_undigraph(&edges);
+                let nc = g.node_count();
+                let ec = g.edge_count();
+                (
+                    nc,
+                    ec,
+                    CachedGraph::Undirected {
+                        graph: Arc::new(g),
+                        id_to_ni: Arc::new(id_to_ni),
+                        ni_to_id: Arc::new(ni_to_id),
+                        node_count: nc,
+                        edge_count: ec,
+                    },
+                )
+            };
+            let mut reg = GRAPH_REGISTRY
+                .write()
+                .map_err(|e| ExtensionError::new(&e.to_string()))?;
+            reg.insert(name.clone(), cached);
+            bind.add_result_column("name", TypeId::Varchar);
+            bind.add_result_column("nodes", TypeId::Integer);
+            bind.add_result_column("edges", TypeId::Integer);
+            bind.add_result_column("directed", TypeId::Integer);
+            Ok(BuildGraphState {
+                name,
+                node_count: nc,
+                edge_count: ec,
+                directed,
+                done: false,
+            })
+        })
+        .scan(|state, chunk| {
+            if state.done {
+                unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) };
+                return Ok(());
+            }
+            state.done = true;
+            let raw = unsafe { chunk.as_raw() };
+            unsafe { write_varchar_col(raw, 0, &[state.name.clone()], 1) };
+            unsafe { write_i32_col(raw, 1, &[state.node_count as i32], 1) };
+            unsafe { write_i32_col(raw, 2, &[state.edge_count as i32], 1) };
+            unsafe { write_i32_col(raw, 3, &[state.directed as i32], 1) };
+            unsafe { duckdb_data_chunk_set_size(raw, 1) };
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
 // Entrypoint
 // ═══════════════════════════════════════════════
 
@@ -988,6 +1132,7 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     reg!(build_petgraph_is_cyclic());
     reg!(build_petgraph_edges());
     reg!(build_petgraph_neighbors());
+    reg!(build_petgraph_build_graph_list());
     Ok(())
 }
 
