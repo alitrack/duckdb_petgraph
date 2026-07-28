@@ -10,6 +10,9 @@ USE_UNSTABLE_C_API=1
 # Target DuckDB C API version
 TARGET_DUCKDB_VERSION=v1.5.5
 
+# Use py3.6-compatible test version for venv pip install
+DUCKDB_TEST_VERSION=1.2.0
+
 # Skip tests for now — add SQLLogicTest files later
 SKIP_TESTS=0
 
