@@ -1,0 +1,69 @@
+name: Main Extension Distribution Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/master' || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  linux-amd64-smoke:
+    name: Linux amd64 smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq make ninja-build jq
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: SQLLogicTest
+        run: make test_release
+      - name: Verify
+        run: ls -la build/release/petgraph_ext.duckdb_extension
+
+  macos-arm64-smoke:
+    name: macOS arm64 smoke
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: SQLLogicTest
+        run: make test_release
+
+  duckdb-stable-build:
+    name: Distribution
+    needs: [linux-amd64-smoke, macos-arm64-smoke]
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5-variegata
+      extension_name: petgraph_ext
+      extra_toolchains: rust
+      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw'
+    secrets: inherit
