@@ -3,23 +3,27 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=petgraph_ext
-
-# Required: duckdb-rs relies on unstable C API functionality
 USE_UNSTABLE_C_API=1
-
-# Target DuckDB version (must match duckdb = "=1.10505.0" pin in Cargo.toml)
 TARGET_DUCKDB_VERSION=v1.5.5
 
-# Pin the test runner — use py3.6-compatible version (CI Docker lacks Python 3.12)
-DUCKDB_TEST_VERSION=1.2.0
+# Force configure inside Docker
+CONFIGURE_CI_STEP=minimal_configure
 
 all: configure debug
 
-# Include makefiles from DuckDB extension-ci-tools
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-configure: venv platform extension_version
+configure: minimal_configure
+
+# Minimal configure: write files without importing duckdb (compat with CI Docker py3.6)
+minimal_configure:
+	@mkdir -p configure
+	@echo "$${DUCKDB_PLATFORM:-$$(uname -s)_$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}" | tr '[:upper:]' '[:lower:]' > configure/platform.txt
+	@echo "$${EXTENSION_VERSION:-v0.5.0}" > configure/extension_version.txt
+	@$(PYTHON_BIN) -m venv --without-pip configure/venv 2>/dev/null || $(PYTHON_BIN) -m venv configure/venv 2>/dev/null || \
+	(echo "#!/bin/sh" > configure/venv/bin/python3 && chmod +x configure/venv/bin/python3 && mkdir -p configure/venv/bin && which python3 > /dev/null && ln -sf $$(which python3) configure/venv/bin/python3)
+	@echo "Configure done: $$(cat configure/platform.txt) $$(cat configure/extension_version.txt)"
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
 release: build_extension_library_release build_extension_with_metadata_release
