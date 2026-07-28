@@ -7,11 +7,8 @@ EXTENSION_NAME=petgraph_ext
 # Set to 1 to enable Unstable API
 USE_UNSTABLE_C_API=1
 
-# Target DuckDB C API version
-TARGET_DUCKDB_VERSION=v1.5.5
-
-# Use py3.6-compatible test version for venv pip install
-DUCKDB_TEST_VERSION=1.2.0
+# Target DuckDB C API version (v1.5.4 for Python 3.6 compat in CI Docker)
+TARGET_DUCKDB_VERSION=v1.5.4
 
 # Skip tests for now — add SQLLogicTest files later
 SKIP_TESTS=0
