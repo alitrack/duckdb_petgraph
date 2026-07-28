@@ -4,18 +4,18 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=petgraph_ext
 
-# Set to 1 to enable Unstable API
+# Required: duckdb-rs relies on unstable C API functionality
 USE_UNSTABLE_C_API=1
 
-# Target DuckDB C API version (v1.5.4 for Python 3.6 compat in CI Docker)
-TARGET_DUCKDB_VERSION=v1.5.4
+# Target DuckDB version
+TARGET_DUCKDB_VERSION=v1.5.5
 
-# Skip tests for now — add SQLLogicTest files later
-SKIP_TESTS=0
+# Pin the test runner to the same DuckDB version
+DUCKDB_TEST_VERSION=1.5.5
 
 all: configure debug
 
-# Include makefiles from DuckDB
+# Include makefiles from DuckDB extension-ci-tools
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
