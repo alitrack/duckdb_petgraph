@@ -7,11 +7,11 @@ EXTENSION_NAME=petgraph_ext
 # Required: duckdb-rs relies on unstable C API functionality
 USE_UNSTABLE_C_API=1
 
-# Target DuckDB version
+# Target DuckDB version (must match duckdb = "=1.10505.0" pin in Cargo.toml)
 TARGET_DUCKDB_VERSION=v1.5.5
 
-# Pin the test runner to the same DuckDB version
-DUCKDB_TEST_VERSION=1.5.5
+# Pin the test runner — use py3.6-compatible version (CI Docker lacks Python 3.12)
+DUCKDB_TEST_VERSION=1.2.0
 
 all: configure debug
 
