@@ -21,41 +21,40 @@ SELECT (i % 10000)::INTEGER AS src, ((i * 7 + 3) % 10000)::INTEGER AS dst,
        (1.0 + (i % 10))::FLOAT AS weight
 FROM generate_series(1, 100000) t(i);
 
--- Build graphs
-SELECT * FROM petgraph_build_graph('gsmall', 'edges_small', 'src', 'dst', 'weight', TRUE);
-SELECT * FROM petgraph_build_graph('gmedium', 'edges_medium', 'src', 'dst', 'weight', TRUE);
-SELECT * FROM petgraph_build_graph('glarge', 'edges_large', 'src', 'dst', 'weight', TRUE);
+-- Build graphs using string_agg
+SELECT * FROM petgraph_build_graph('gsmall',
+    (SELECT '[' || string_agg('(' || src || ',' || dst || ',' || weight || ')', ',') || ']' FROM edges_small), 1);
+SELECT * FROM petgraph_build_graph('gmedium',
+    (SELECT '[' || string_agg('(' || src || ',' || dst || ',' || weight || ')', ',') || ']' FROM edges_medium), 1);
+SELECT * FROM petgraph_build_graph('glarge',
+    (SELECT '[' || string_agg('(' || src || ',' || dst || ',' || weight || ')', ',') || ']' FROM edges_large), 1);
 
 -- ====== Algorithms ======
 -- Connected Components
-SELECT * FROM petgraph_connected_components('gsmall');
-SELECT * FROM petgraph_connected_components('gmedium');
-SELECT * FROM petgraph_connected_components('glarge');
+SELECT count(*) FROM petgraph_connected_components('@gsmall');
+SELECT count(*) FROM petgraph_connected_components('@gmedium');
+SELECT count(*) FROM petgraph_connected_components('@glarge');
 
 -- PageRank
-SELECT * FROM petgraph_pagerank('gsmall');
-SELECT * FROM petgraph_pagerank('gmedium');
-SELECT * FROM petgraph_pagerank('glarge');
+SELECT count(*) FROM petgraph_pagerank('@gsmall', 0.85, 20);
+SELECT count(*) FROM petgraph_pagerank('@gmedium', 0.85, 20);
+SELECT count(*) FROM petgraph_pagerank('@glarge', 0.85, 20);
 
--- Shortest Path (from node 0)
-SELECT * FROM petgraph_shortest_path('gsmall', 0::INTEGER);
-SELECT * FROM petgraph_shortest_path('gmedium', 0::INTEGER);
-SELECT * FROM petgraph_shortest_path('glarge', 0::INTEGER);
+-- Shortest Path (from node 0 to node 1)
+SELECT * FROM petgraph_shortest_path('@gsmall', 0, 1);
+SELECT * FROM petgraph_shortest_path('@gmedium', 0, 1);
+SELECT * FROM petgraph_shortest_path('@glarge', 0, 1);
 
 -- SCC
-SELECT * FROM petgraph_scc('gsmall');
-SELECT * FROM petgraph_scc('gmedium');
-SELECT * FROM petgraph_scc('glarge');
+SELECT count(*) FROM petgraph_scc('@gsmall');
+SELECT count(*) FROM petgraph_scc('@gmedium');
+SELECT count(*) FROM petgraph_scc('@glarge');
 
 -- Betweenness Centrality
-SELECT * FROM petgraph_betweenness_centrality('gsmall');
-SELECT * FROM petgraph_betweenness_centrality('gmedium');
-SELECT * FROM petgraph_betweenness_centrality('glarge');
+SELECT count(*) FROM petgraph_betweenness_centrality('@gsmall');
 
 -- MST (undirected only)
-SELECT * FROM petgraph_mst('gsmall');
-SELECT * FROM petgraph_mst('gmedium');
-SELECT * FROM petgraph_mst('glarge');
+SELECT count(*) FROM petgraph_mst('@gsmall');
 
 -- Cleanup
 SELECT * FROM petgraph_drop_graph('gsmall');

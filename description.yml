@@ -32,7 +32,7 @@ docs:
 
     ### Features
 
-    - **16 table functions**: build_graph, list_graphs, drop_graph, edges, neighbors,
+    - **17 table functions**: build_graph, list_graphs, drop_graph, edges, neighbors,
       shortest_path, connected_components, pagerank, betweenness_centrality,
       closeness_centrality, eigenvector_centrality, scc, mst, louvain, toposort, is_cyclic
     - **Named graph cache**: build once with `petgraph_build_graph('name', ...)` and

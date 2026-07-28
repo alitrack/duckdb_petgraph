@@ -3,6 +3,7 @@ use petgraph::{
     data::Element,
     graph::{DiGraph, NodeIndex, UnGraph},
     visit::{Dfs, EdgeRef},
+    Direction,
 };
 use quack_rs::{
     prelude::*,
@@ -189,8 +190,8 @@ unsafe fn write_varchar_col(chunk: duckdb_data_chunk, col: usize, data: &[String
 fn read_list_i32(val: duckdb_value, len: usize) -> Vec<i32> {
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
-        let child = unsafe { duckdb_get_list_child(val, i as idx_t) };
-        result.push(unsafe { duckdb_get_int32(child) });
+        let child = unsafe { quack_rs::value::Value::from_raw(duckdb_get_list_child(val, i as idx_t)) };
+        result.push(child.as_i32());
     }
     result
 }
@@ -199,8 +200,8 @@ fn read_list_i32(val: duckdb_value, len: usize) -> Vec<i32> {
 fn read_list_f64(val: duckdb_value, len: usize) -> Vec<f64> {
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
-        let child = unsafe { duckdb_get_list_child(val, i as idx_t) };
-        result.push(unsafe { duckdb_get_double(child) });
+        let child = unsafe { quack_rs::value::Value::from_raw(duckdb_get_list_child(val, i as idx_t)) };
+        result.push(child.as_f64());
     }
     result
 }
@@ -633,7 +634,7 @@ fn closeness_centrality(g: &DiGraph<(), f64>) -> Vec<f64> {
         let sum: usize = dist.iter().filter_map(|&d| d).sum();
         let reachable = dist.iter().filter(|&&d| d.is_some()).count();
         if reachable > 1 && sum > 0 {
-            closeness[start_idx] = (reachable - 1) as f64 * (reachable - 1) as f64 / ((n - 1) as f64 * sum as f64);
+            closeness[start_idx] = (reachable - 1) as f64 / ((n - 1) as f64 * sum as f64);
         }
     }
     closeness
@@ -683,12 +684,12 @@ fn eigenvector_centrality(g: &DiGraph<(), f64>, max_iter: usize, tolerance: f64)
     let node_to_idx: HashMap<NodeIndex, usize> = idx_to_node.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     let mut x = vec![1.0; n];
     for _iter in 0..max_iter {
-        let mut x_new = vec![0.0; n];
-        for (i, node) in idx_to_node.iter().enumerate() {
-            for neighbor in g.neighbors(*node) {
-                x_new[i] += x[node_to_idx[&neighbor]];
-            }
+    let mut x_new = vec![0.0; n];
+    for (i, node) in idx_to_node.iter().enumerate() {
+        for neighbor in g.neighbors_directed(*node, Direction::Incoming) {
+            x_new[i] += x[node_to_idx[&neighbor]];
         }
+    }
         let norm: f64 = x_new.iter().map(|v| v * v).sum::<f64>().sqrt();
         if norm < 1e-15 { break; }
         for v in x_new.iter_mut() { *v /= norm; }
@@ -753,7 +754,8 @@ fn louvain_community(g: &DiGraph<(), f64>) -> Vec<usize> {
     let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     for (i, node) in idx_to_node.iter().enumerate() {
         for neighbor in g.neighbors(*node) {
-            if let Some(&ni) = node_to_idx.get(&neighbor) { adj[i].push((ni, 1.0)); }
+            let weight = g.edges(*node).find(|e| g.edge_endpoints(e.id()).unwrap().1 == neighbor).map(|e| *e.weight()).unwrap_or(1.0);
+            if let Some(&ni) = node_to_idx.get(&neighbor) { adj[i].push((ni, weight)); }
         }
     }
     let mut community: Vec<usize> = (0..n).collect();
