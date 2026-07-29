@@ -11,7 +11,7 @@ use quack_rs::{
     types::{LogicalType, TypeId},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     sync::{Arc, LazyLock, RwLock},
 };
@@ -794,6 +794,114 @@ fn louvain_community(g: &DiGraph<(), f64>) -> Vec<usize> {
     result
 }
 
+// ═══════════════════════════════════════════════
+// 12a. petgraph_triangles
+// ═══════════════════════════════════════════════
+
+/// Count triangles per vertex or total for the graph.
+struct TrState { data: Vec<(i32, i32)>, offset: usize }
+
+fn build_petgraph_triangles() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_triangles")
+        .param(TypeId::Varchar)
+        .with_state::<TrState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or(""))
+                .map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let mut triangles: HashMap<NodeIndex, i32> = HashMap::new();
+            for edge in g.edge_indices() {
+                let (u, v) = g.edge_endpoints(edge).unwrap();
+                // Count common neighbors = triangles containing this edge
+                let u_neighbors: HashSet<NodeIndex> = g.neighbors(u).collect();
+                for w in g.neighbors(v) {
+                    if u_neighbors.contains(&w) {
+                        *triangles.entry(u).or_insert(0) += 1;
+                        *triangles.entry(v).or_insert(0) += 1;
+                        *triangles.entry(w).or_insert(0) += 1;
+                    }
+                }
+            }
+            // Each triangle counted 3 times
+            for v in triangles.values_mut() { *v /= 3; }
+            let mut data: Vec<(i32, i32)> = triangles.iter()
+                .map(|(ni, count)| (ni_to_id.get(ni).copied().unwrap_or(-1), *count))
+                .collect();
+            data.sort_by_key(|d| d.0);
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("triangle_count", TypeId::Integer);
+            Ok(TrState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let counts: Vec<i32> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_i32_col(raw, 1, &counts, n) };
+            state.offset += n;
+            Ok(())
+        })
+        .build()
+}
+
+// ═══════════════════════════════════════════════
+// 12b. petgraph_clustering
+// ═══════════════════════════════════════════════
+
+/// Local clustering coefficient: triangles(v) / (deg(v) * (deg(v)-1) / 2)
+struct ClustState { data: Vec<(i32, f64)>, offset: usize }
+
+fn build_petgraph_clustering() -> Result<TableFunctionBuilder, ExtensionError> {
+    TableFunctionBuilder::new("petgraph_clustering")
+        .param(TypeId::Varchar)
+        .with_state::<ClustState, _>(|bind| {
+            let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or(""))
+                .map_err(|e| ExtensionError::new(&e.to_string()))?;
+            let mut data = Vec::new();
+            for node in g.node_indices() {
+                let neighbors: Vec<NodeIndex> = g.neighbors(node).collect();
+                let deg = neighbors.len();
+                if deg < 2 {
+                    data.push((ni_to_id.get(&node).copied().unwrap_or(-1), 0.0));
+                    continue;
+                }
+                let neighbor_set: HashSet<NodeIndex> = neighbors.iter().copied().collect();
+                let mut triangles = 0i32;
+                for &n in &neighbors {
+                    for w in g.neighbors(n) {
+                        if w != node && neighbor_set.contains(&w) {
+                            triangles += 1;
+                        }
+                    }
+                }
+                triangles /= 2; // each triangle counted twice
+                let max_pairs = (deg * (deg - 1)) / 2;
+                let coeff = triangles as f64 / max_pairs as f64;
+                data.push((ni_to_id.get(&node).copied().unwrap_or(-1), coeff));
+            }
+            data.sort_by_key(|d| d.0);
+            bind.add_result_column("node", TypeId::Integer);
+            bind.add_result_column("clustering_coefficient", TypeId::Float);
+            Ok(ClustState { data, offset: 0 })
+        })
+        .scan(|state, chunk| {
+            let remaining = state.data.len().saturating_sub(state.offset);
+            let n = remaining.min(2048);
+            if n == 0 { unsafe { duckdb_data_chunk_set_size(chunk.as_raw(), 0) }; return Ok(()); }
+            let raw = unsafe { chunk.as_raw() };
+            let slice = &state.data[state.offset..state.offset + n];
+            let nodes: Vec<i32> = slice.iter().map(|r| r.0).collect();
+            let coeffs: Vec<f64> = slice.iter().map(|r| r.1).collect();
+            unsafe { write_i32_col(raw, 0, &nodes, n) };
+            unsafe { write_f64_col(raw, 1, &coeffs, n) };
+            state.offset += n;
+            Ok(())
+        })
+        .build()
+}
+
 struct LvState { data: Vec<(i32, i32)>, offset: usize }
 
 fn build_petgraph_louvain() -> Result<TableFunctionBuilder, ExtensionError> {
@@ -1129,6 +1237,8 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     reg!(build_petgraph_mst());
     reg!(build_petgraph_closeness_centrality());
     reg!(build_petgraph_eigenvector_centrality());
+    reg!(build_petgraph_triangles());
+    reg!(build_petgraph_clustering());
     reg!(build_petgraph_louvain());
     reg!(build_petgraph_toposort());
     reg!(build_petgraph_is_cyclic());
