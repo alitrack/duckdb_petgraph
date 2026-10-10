@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-petgraph",
+  "owner": {
+    "name": "alitrack",
+    "url": "https://github.com/alitrack"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-petgraph",
+      "description": "Verified SQL knowledge for the petgraph_ext DuckDB extension: 16 graph algorithms (PageRank, centrality, Louvain, SCC, shortest path, MST...) on inline or cached graphs",
+      "source": "./duckdb-petgraph",
+      "category": "data"
+    }
+  ]
+}

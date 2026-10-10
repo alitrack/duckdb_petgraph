@@ -1,0 +1,9 @@
+{
+  "name": "duckdb-petgraph",
+  "version": "0.5.1",
+  "description": "Verified knowledge for the petgraph_ext DuckDB extension: building graphs (inline string or cached by name or LIST-typed), and 16 algorithms from PageRank to Louvain communities.",
+  "author": {
+    "name": "alitrack"
+  },
+  "homepage": "https://github.com/alitrack/duckdb_petgraph"
+}
