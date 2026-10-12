@@ -439,9 +439,47 @@ fn build_petgraph_pagerank() -> Result<TableFunctionBuilder, ExtensionError> {
                 return Err(ExtensionError::new("petgraph_pagerank: expected 3 params (graph, alpha, iterations)"));
             }
             let (g, _, ni_to_id) = resolve_digraph(&unsafe { bind.get_parameter_value(0) }.as_str_or("")).map_err(|e| ExtensionError::new(&e.to_string()))?;
+            // Sparse edge-driven PageRank (O(|V|+|E|) per iteration).
+            // petgraph 0.7.1's algo::page_rank is a dense O(|V|^2|E|) textbook
+            // implementation AND mathematically incorrect (see upstream issue #960:
+            // link propagation / dangling redistribution / teleportation are mutually
+            // exclusive if/else branches instead of being summed). We implement the
+            // correct recurrence here instead of calling the library.
+            let node_count = g.node_count();
+            if node_count == 0 { return Ok(PrState { data: Vec::new(), offset: 0 }); }
             let alpha = unsafe { bind.get_parameter_value(1) }.as_f64_or(0.85);
-            let iterations = unsafe { bind.get_parameter_value(2) }.as_i64_or(20) as usize;
-            let scores = algo::page_rank(&g, alpha, iterations);
+            let iterations = unsafe { bind.get_parameter_value(2) }.as_i64_or(20).max(1) as usize;
+            let n = node_count;
+            // incoming adjacency (edge-driven)
+            let mut incoming: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+            let mut out_w: Vec<f64> = vec![0.0; n];
+            for e in g.edge_references() {
+                let s = e.source().index();
+                let t = e.target().index();
+                let w = *e.weight();
+                incoming[t].push((s, w));
+                out_w[s] += w;
+            }
+            let nb = n as f64;
+            let mut ranks = vec![1.0 / nb; n];
+            let teleport = (1.0 - alpha) / nb;
+            for _ in 0..iterations {
+                let mut dangling = 0.0f64;
+                for i in 0..n { if out_w[i] == 0.0 { dangling += ranks[i]; } }
+                let dangling_share = alpha * dangling / nb;
+                let mut next = vec![teleport + dangling_share; n];
+                for v in 0..n {
+                    let mut s = 0.0f64;
+                    for &(w_src, w) in &incoming[v] {
+                        s += alpha * ranks[w_src] * w / out_w[w_src];
+                    }
+                    next[v] += s;
+                }
+                let sum: f64 = next.iter().sum();
+                if sum > 0.0 { for r in next.iter_mut() { *r /= sum; } }
+                ranks = next;
+            }
+            let scores = ranks;
             let mut data: Vec<(i32, f64)> = scores.iter().enumerate()
                 .map(|(i, s)| { let ni = NodeIndex::new(i); (ni_to_id.get(&ni).copied().unwrap_or(i as i32), *s) })
                 .collect();

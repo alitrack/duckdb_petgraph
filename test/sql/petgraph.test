@@ -93,9 +93,27 @@ SELECT * FROM petgraph_connected_components('[]')
 ----
 
 # --------- PageRank ---------
+# 3-cycle: symmetric, all scores equal 1/3 (old dense impl also passed this by luck)
 query IF
 SELECT * FROM petgraph_pagerank('[(0,1,1),(1,2,1),(2,0,1)]', 0.85, 20)
 ----
+
+# chain with dangling node 2: sparse impl with dangling redistribution
+# networkx: {0: 0.184417, 1: 0.341171, 2: 0.474412}
+query IF
+SELECT node, round(score, 6) FROM petgraph_pagerank('[(0,1,1.0),(1,2,1.0)]', 0.85, 50) ORDER BY node
+----
+0	0.184417
+1	0.341171
+2	0.474412
+
+# cycle + chord (0->2 extra edge), from upstream issue #960 family: sum must be 1
+query IF
+SELECT node, round(score, 6) FROM petgraph_pagerank('[(0,1,1.0),(1,2,1.0),(2,0,1.0),(0,2,1.0)]', 0.85, 50) ORDER BY node
+----
+0	0.387790
+1	0.214811
+2	0.397400
 
 # --------- Betweenness Centrality (undirected) ---------
 query IF

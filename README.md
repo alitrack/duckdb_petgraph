@@ -71,7 +71,7 @@ SELECT * FROM petgraph_build_graph(
 | `petgraph_closeness_centrality(graph)` | graph | (node INT, centrality DOUBLE) |
 | `petgraph_eigenvector_centrality(graph, iterations, tolerance)` | graph, max_iter, tolerance | (node INT, centrality DOUBLE) |
 | `petgraph_scc(graph)` | graph (directed) | (node INT, scc_id INT) |
-| `petgraph_louvain(graph)` | graph | (node INT, community_id INT) |
+| `petgraph_louvain(graph)` | graph (directed) | (node INT, community_id INT) |
 | `petgraph_toposort(graph)` | graph (directed) | (order INT, node INT) |
 | `petgraph_is_cyclic(graph)` | graph (directed) | (is_cyclic INT) |
 | `petgraph_mst(graph)` | graph (undirected) | (src INT, dst INT, weight DOUBLE) |
